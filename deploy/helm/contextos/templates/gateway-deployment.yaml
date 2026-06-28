@@ -1,0 +1,58 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "contextos.name" . }}-gateway
+  labels:
+    {{- include "contextos.labels" . | nindent 4 }}
+    app.kubernetes.io/component: gateway
+spec:
+  replicas: {{ .Values.gateway.replicaCount }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "contextos.name" . }}
+      app.kubernetes.io/component: gateway
+  template:
+    metadata:
+      labels:
+        {{- include "contextos.labels" . | nindent 8 }}
+        app.kubernetes.io/component: gateway
+    spec:
+      securityContext:
+        runAsNonRoot: true
+      {{- if .Values.gateway.topologySpreadAcrossZones }}
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: {{ include "contextos.name" . }}
+              app.kubernetes.io/component: gateway
+      {{- end }}
+      containers:
+        - name: gateway
+          image: "{{ .Values.gateway.image.repository }}:{{ .Values.gateway.image.tag }}"
+          imagePullPolicy: {{ .Values.gateway.image.pullPolicy }}
+          ports:
+            - containerPort: 8080
+          env:
+            - name: CONTEXTOS_BACKEND_KIND
+              value: {{ .Values.backend.kind | quote }}
+            - name: CONTEXTOS_BACKEND_BASE_URL
+              value: {{ .Values.backend.baseUrl | quote }}
+            - name: CONTEXTOS_DEFAULT_MODEL
+              value: {{ .Values.backend.defaultModel | quote }}
+            - name: CONTEXTOS_POSTGRES_DSN
+              value: {{ .Values.stores.postgres.dsn | quote }}
+            - name: CONTEXTOS_REDIS_URL
+              value: {{ .Values.stores.redis.url | quote }}
+          readinessProbe:
+            httpGet: { path: /healthz, port: 8080 }
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /healthz, port: 8080 }
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          resources:
+            {{- toYaml .Values.gateway.resources | nindent 12 }}

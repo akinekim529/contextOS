@@ -1,0 +1,132 @@
+# ContextOS Hot-Path / Async-Plane Component Diagram
+
+Legend:  ==>  synchronous critical path (counts toward <250 ms p95 control overhead)
+         -->  async/off-hot-path (Redis Streams; never blocks the client response)
+         [p95] inline per-hop latency from the Section 9 authoritative budget
+         Model inference is EXCLUDED from every ContextOS budget.
+
+
+  +---------------------------+
+  | Client / SDK (OpenAI-     |   POST /v1/chat/completions  (SSE stream back)
+  | compatible; Idempotency-  |   Bearer <tenant API key / JWT>
+  | Key + tenant credential)  |
+  +-------------+-------------+
+                |  HTTPS REST/JSON  (REST chosen over gRPC at the edge:
+                |                    browser/SDK reach + OpenAI wire-compat;
+                v                    gRPC rejected at edge -> only internal)
+  +======================================================================+
+  |  STATELESS FASTAPI / STARLETTE GATEWAY  (Uvicorn + uvloop)            |
+  |  >=3 replicas / >=3 AZ, PDB minAvailable=2, 5k-10k req/s per node     |
+  |  (rejected: Flask/WSGI = no native async; Go gateway = splits the     |
+  |   Python control plane and loses PyO3 kernel co-location)             |
+  |                                                                       |
+  |   +---------------------------------------------------------------+   |
+  |   |  SECURITY CONTEXT CHOKE POINT  (single mandatory gate)        |   |
+  |   |  parse + authn -> tenant_id resolve -> SET LOCAL RLS GUC      |   |
+  |   |  -> within-tenant namespace HARD filter (C2 fail-closed:      |   |
+  |   |     missing/ambiguous namespace = DENY)                       |   |
+  |   |  Every downstream store call inherits this SecurityContext.   |   |
+  |   |  Postgres FORCE ROW LEVEL SECURITY + RBAC firewall =>         |   |
+  |   |  cross-tenant leakage target 0.                  [edge 5 ms]  |   |
+  |   +-------------------------------+-------------------------------+   |
+  |                                   |                                   |
+  |   v=========================== SYNCHRONOUS HOT PATH ==============v    |
+  |   |                                                              |    |
+  |   |  (1) CACHE LOOKUP                                  [10 ms]    |    |
+  |   |      exact-hash (Redis)  <1 ms p99  --HIT--> serve & stream   |    |
+  |   |      semantic-ANN (pgvector/Qdrant) 8-15 ms; miss adds       |    |
+  |   |      embed 6 ms + ANN 4 ms. COARSE fingerprint (C6); memory- |    |
+  |   |      private-grounded = non-cacheable. hit-ratio 25-45%.     |    |
+  |   |        |  (miss)                                             |    |
+  |   |        v                                                     |    |
+  |   |  (2) MEMORY RETRIEVE  -> RAW candidates only (C1)  [40 ms]    |    |
+  |   |      query-embed reused 6 ms; pgvector HNSW ANN 18 ms        |    |
+  |   |      || BM25 12 ms; RRF fuse + rescore 6 ms. <100 ms SLO.    |    |
+  |   |      Working/short-term = Redis TTL; long-term = PG+pgvector.|    |
+  |   |      <=512 candidate HARD CAP (never builds an index).       |    |
+  |   |        |                                                     |    |
+  |   |        v                                                     |    |
+  |   |  (3) ACL / REDACTION  (repository-boundary tenant_id filter; |    |
+  |   |      RTBF tombstones excluded; field-level redaction)        |    |
+  |   |        |   <-- INVARIANT: compression ALWAYS runs AFTER this |    |
+  |   |        v                                                     |    |
+  |   |  (4) COMPRESSION  (2-4x reduction, >=98% fact retention,     |    |
+  |   |      NLI-guarded; runs on already-redacted text only)        |    |
+  |   |        |                                                     |    |
+  |   |        v                                                     |    |
+  |   |  (5) CONTEXT ASSEMBLER  (SOLE final-rank + budget authority) |    |
+  |   |      score <=512 + MMR + budget knapsack + edge-place        |    |
+  |   |      (lost-in-the-middle).                         [50 ms]    |    |
+  |   |      PROVISIONAL Rust/PyO3 kernel behind ADR-0001 gate.      |    |
+  |   |        |   (router selected BEFORE final packing so the      |    |
+  |   |        |    correct tokenizer enforces the hard reserve; C3) |    |
+  |   |        v                                                     |    |
+  |   |  (6) MODEL ROUTER  (difficulty + utility + breaker) [5 ms]    |    |
+  |   |      hard filters (allowlist/residency/capability/budget)    |    |
+  |   |      fail-CLOSED on static policy (C9); RBAC check(           |    |
+  |   |      principal, model, action='route') is sole authority(C10)|    |
+  |   |      GPU-aware signal = telemetry READER only.               |    |
+  |   |        |                                                     |    |
+  |   |        v                                                     |    |
+  |   |  (7) BACKEND ADAPTER dispatch + 1st-token handshake [8 ms]    |    |
+  |   |        |                                                     |    |
+  |   |        v                                                     |    |
+  |   |  (8) STREAMER (SSE)  --> back to Client/SDK                  |    |
+  |   |        |    C8: server finish_reason => commit write-back;   |    |
+  |   |        |    client TCP close before terminal => discard.     |    |
+  |   v==============================================================v    |
+  |            |                                                          |
+  |            |  (9) ASYNC WRITE-BACK ENQUEUE  [2 ms] (off hot path)     |
+  |            +------------------------------> Redis Streams (below)     |
+  +============|==========================================================+
+              ||  backend.invoke (NON-deterministic; outside ContextOS budget)
+              vv
+       +--------------------------------------------------------------+
+       |  BACKEND ADAPTERS (pluggable; OpenAI wire-compat normalized)  |
+       |   vLLM  |  OpenAI  |  Ollama  |  TGI                          |
+       |   safe-default pool itself satisfies ALL hard filters (C9)    |
+       +--------------------------------------------------------------+
+
+
+  ================= ASYNCHRONOUS BACKGROUND PLANE (NEVER on hot path) =================
+
+       Redis Streams  (custom asyncio consumer; DOUBLES AS THE REPLAY LOG)
+       per-tenant namespaced; one ReplayResult schema (C7) appended here
+            |              |                |                  |
+            v              v                v                  v
+   +----------------+ +--------------+ +---------------+ +------------------------+
+   | EMBEDDING      | | CONSOLIDATION| | TRACE FLUSH   | | RTBF CASCADE worker    |
+   | worker (own    | | worker       | | worker        | | tombstone + idempotent |
+   | K8s Deploy,    | | rate-limited,| | tail 1-10%    | | GC sweep across stores |
+   | KEDA-scaled;   | | COST-TRACKED | | sample +force | | crypto-shred per-subj  |
+   | BGE bge-small  | | batch -> cost| | keep errors & | | DEK (embeddings in     |
+   | 384-dim, ~6 ms | | ledger; NOT  | | cost>$0.05    | | scope, C11). Billing   |
+   | p95; BM25-only | | an agent loop| | (best-effort, | | cost = fail-closed     |
+   | fallback <=12% | | C-tracked)   | | fail-open C12)| | durable OUTBOX (C12).  |
+   | recall loss    | |              | |               | |                        |
+   +-------+--------+ +------+-------+ +-------+-------+ +-----------+------------+
+           |                 |                |                     |
+           v                 v                v                     v
+  +-------------------------------------------------------------------------------+
+  |                              BACKING STORES                                   |
+  |                                                                              |
+  |  +-------------+   +-----------------------------+   +--------------------+   |
+  |  | Redis       |   | Postgres 16                 |   | Qdrant (OPTIONAL   |   |
+  |  | exact cache |   | tenant_id partition key     |   | escape hatch >5M   |   |
+  |  | <1 ms p99;  |   | + FORCE RLS; relational +   |   | vectors/tenant;    |   |
+  |  | working/    |   | pgvector HNSW (ANN 18 ms    |   | ANN <=25 ms p95    |   |
+  |  | short-term  |   | p95 @ <=5M vec/tenant) =     |   | post-cutover)      |   |
+  |  | mem TTL;    |   | long-term/episodic/semantic |   | via VectorStore    |   |
+  |  | streams     |   | memory + semantic cache tier|   | adapter            |   |
+  |  +-------------+   +--------------+--------------+   +--------------------+   |
+  |                                  |                                           |
+  |                                  v                                           |
+  |                        +--------------------+                                |
+  |                        | KMS / per-tenant   |  per-subject DEK -> crypto-    |
+  |                        | DEK custody        |  shred (RTBF); encrypts        |
+  |                        | (envelope encrypt) |  replay bundle + vector payload|
+  |                        +--------------------+                                |
+  +-------------------------------------------------------------------------------+
+
+  Critical-path note: cache + retrieval + assembly OVERLAP. <250 ms p95 is the
+  critical-path bound, NOT a naive sum of per-hop figures; inference is excluded.

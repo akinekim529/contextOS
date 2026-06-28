@@ -1,0 +1,60 @@
+syntax = "proto3";
+
+package contextos.memory.v1;
+
+enum MemoryTier {
+  TIER_UNSPECIFIED = 0;
+  WORKING = 1;
+  SHORT_TERM = 2;
+  LONG_TERM = 3;
+  EPISODIC = 4;
+  SEMANTIC = 5;
+}
+
+message EmbeddingRef {
+  string store = 1;          // pgvector | qdrant
+  string collection = 2;
+  string vector_id = 3;
+  uint32 dim = 4;            // 384 (bge-small-en-v1.5)
+  string dek_id = 5;        // per-subject DEK -> embeddings are in crypto-shred scope (C11)
+}
+
+message MemoryObject {
+  string id = 1;            // ULID
+  string tenant_id = 2;     // non-null partition key
+  string namespace = 3;     // hard filter within tenant (C2)
+  MemoryTier tier = 4;
+  string content = 5;
+  EmbeddingRef embedding_ref = 6;
+  float importance = 7;
+  string created_at = 8;
+  string last_accessed_at = 9;
+}
+
+// Retrieval returns RAW per-modality scores only; the Assembler ranks and packs (C1).
+message MemoryCandidate {
+  string memory_id = 1;
+  string tenant_id = 2;
+  string namespace = 3;
+  string content = 4;
+  float vector_score = 5;
+  float lexical_score = 6;
+  float recency_score = 7;
+  float importance = 8;
+}
+
+message RetrieveRequest {
+  string tenant_id = 1;
+  string namespace = 2;
+  string query = 3;
+  uint32 k = 4;             // bounded by the <=512 scope-boundary cap
+}
+
+message RetrieveResponse {
+  repeated MemoryCandidate candidates = 1;
+}
+
+service MemoryService {
+  rpc Write(MemoryObject) returns (MemoryObject);
+  rpc Retrieve(RetrieveRequest) returns (RetrieveResponse);
+}

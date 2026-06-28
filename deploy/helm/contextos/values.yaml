@@ -1,0 +1,38 @@
+# ContextOS Helm values surface. Stores default to in-cluster references; point them at
+# operator-managed or external Postgres/Redis/Qdrant in production.
+
+gateway:
+  image:
+    repository: ghcr.io/contextos/contextos
+    tag: "0.0.1"
+    pullPolicy: IfNotPresent
+  replicaCount: 3                 # >=3 across >=3 AZ for the 99.9% target
+  resources:
+    requests: { cpu: "500m", memory: "512Mi" }
+    limits: { cpu: "2", memory: "1Gi" }
+  # KEDA scales the stateless gateway on request rate.
+  autoscaling:
+    enabled: true
+    minReplicas: 3
+    maxReplicas: 50
+    signal: qps                   # gateway=QPS, worker=stream depth, embedding=queue depth+QPS
+    targetQpsPerReplica: 1500
+  pdb:
+    minAvailable: 2
+  topologySpreadAcrossZones: true
+
+backend:
+  kind: vllm                      # vllm | openai | ollama | tgi
+  baseUrl: "http://vllm.inference.svc.cluster.local:8000"
+  defaultModel: "meta-llama/Llama-3.1-8B-Instruct"
+
+stores:
+  postgres:
+    dsn: ""                       # CloudNativePG cluster DSN; empty -> in-memory (dev only)
+  redis:
+    url: "redis://contextos-redis:6379/0"
+  vector:
+    backend: pgvector             # pgvector at launch; qdrant escape hatch at scale
+
+observability:
+  otelEndpoint: ""                # OTLP collector; traces sampled (fail-open), cost outbox (fail-closed)

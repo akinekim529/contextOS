@@ -1,0 +1,42 @@
+syntax = "proto3";
+
+// Trace + decision records. This contract is the versioned replay schema: a context bundle
+// is reconstructed from these messages, so backward compatibility here == replayability of
+// historical decisions.
+package contextos.trace.v1;
+
+message DecisionRecord {
+  string stage = 1;
+  string summary = 2;
+  map<string, string> pointers = 3;   // content-addressed bundle blob refs
+}
+
+message TraceSpan {
+  string trace_id = 1;
+  string span_id = 2;
+  string parent_span_id = 3;
+  string tenant_id = 4;
+  string stage = 5;                    // auth|cache|retrieve|assemble|route|backend.invoke|writeback
+  string name = 6;
+  string start_rfc3339 = 7;
+  string end_rfc3339 = 8;
+  map<string, string> attributes = 9;
+  DecisionRecord decision = 10;
+}
+
+message ReplayRequest {
+  string tenant_id = 1;
+  string trace_id = 2;
+  bool live_backend = 3;               // false => assert recorded-output equality; true => diff
+}
+
+message ReplayResult {
+  string trace_id = 1;
+  bool decisions_reproduced = 2;       // all ContextOS decision stages bit-identical
+  bool output_equal = 3;               // asserted ONLY when live_backend == false
+  string diff = 4;                     // populated when live_backend == true
+}
+
+service TraceService {
+  rpc GetTrace(ReplayRequest) returns (ReplayResult);
+}

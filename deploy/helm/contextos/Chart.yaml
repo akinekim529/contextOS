@@ -1,0 +1,9 @@
+apiVersion: v2
+name: contextos
+description: ContextOS gateway and control-plane services (umbrella chart).
+type: application
+version: 0.0.1
+appVersion: "0.0.1"
+# Per-service subcharts (memory, cache, router, worker, embedding) are added under
+# deploy/helm/charts/ as the monolith-free decomposition lands in Month 3. They all
+# consume the contextos-common library chart for shared PDB/HPA/NetworkPolicy templates.

@@ -1,0 +1,24 @@
+syntax = "proto3";
+
+package contextos.routing.v1;
+
+message RouteRequest {
+  string tenant_id = 1;
+  string query = 2;
+  uint32 assembled_tokens = 3;
+  float difficulty = 4;          // 0..1, two-stage estimate
+}
+
+// Hard filters (allowlist, residency, capability, budget) are evaluated on STATIC policy and
+// fail closed independent of health-store availability; optimization signals fail open (C9).
+message BackendChoice {
+  string backend = 1;            // resolved from check(action='route') allowlist (C10)
+  string model_id = 2;
+  float utility = 3;             // w_q*quality - w_c*cost - w_l*latency
+  repeated string fallback_chain = 4;
+  bool from_safe_default = 5;    // true => optimization signals were degraded; hard filters still held
+}
+
+service RouterService {
+  rpc Route(RouteRequest) returns (BackendChoice);
+}

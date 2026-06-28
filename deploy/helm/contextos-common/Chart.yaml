@@ -1,0 +1,5 @@
+apiVersion: v2
+name: contextos-common
+description: Library chart of shared templates (labels, PDB, NetworkPolicy) for ContextOS subcharts.
+type: library
+version: 0.0.1
