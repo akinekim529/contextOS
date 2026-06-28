@@ -45,3 +45,17 @@ def test_trace_is_tenant_scoped() -> None:
     # A different tenant cannot read acme's trace.
     other = client.get(f"/v1/traces/{trace_id}", headers={"X-Tenant-Id": "evil", "X-User-Id": "9"})
     assert other.status_code == 404
+
+
+def test_memory_write_then_chat_records_retrieval() -> None:
+    client = _client()
+    h = {"X-Tenant-Id": "acme", "X-User-Id": "123"}
+
+    w = client.post("/v1/memory", json={"content": "user's prod region is eu-west-1"}, headers=h)
+    assert w.status_code == 200, w.text
+
+    r = client.post("/v1/chat", json={"prompt": "which region is prod deployed in?"}, headers=h)
+    trace = client.get(f"/v1/traces/{r.json()['trace_id']}", headers=h).json()
+    retrieve = next(s for s in trace["spans"] if s["stage"] == "retrieve")
+    assert int(retrieve["decision"]["pointers"]["candidates"]) >= 1
+

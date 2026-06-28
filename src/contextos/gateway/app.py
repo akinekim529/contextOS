@@ -22,9 +22,13 @@ from ..adapters.fake import FakeAdapter
 from ..adapters.openai_compatible import OpenAICompatibleAdapter
 from ..adapters.vllm import vllm_adapter
 from ..config.settings import ContextOSSettings
+from ..embedding.hashing import HashingEmbeddingProvider
+from ..memory.engine import MemoryEngine
+from ..models.common import MemoryTier
 from ..pipeline import Pipeline
 from ..security.context import SecurityContext
 from ..security.errors import SecurityError
+from ..store.memory_store import InMemoryStore
 from .errors import envelope
 
 
@@ -33,6 +37,12 @@ class ChatBody(BaseModel):
     model: str | None = None
     system: str | None = None
     max_tokens: int = 512
+
+
+class MemoryBody(BaseModel):
+    content: str
+    tier: MemoryTier = MemoryTier.SEMANTIC
+    importance: float = 0.5
 
 
 def build_adapter(settings: ContextOSSettings) -> BackendAdapter:
@@ -45,6 +55,12 @@ def build_adapter(settings: ContextOSSettings) -> BackendAdapter:
     # openai / tgi / ollama all speak the OpenAI-compatible wire format
     return OpenAICompatibleAdapter(base_url=settings.backend_base_url, model=settings.default_model,
                                    api_key=settings.backend_api_key, name=kind)
+
+
+def build_memory_engine(settings: ContextOSSettings) -> MemoryEngine:
+    # Skeleton: in-memory store (the leakage-tested boundary) + dependency-free embeddings.
+    # Production swaps in PostgresStore (pgvector) + a BGE EmbeddingProvider — same MemoryEngine.
+    return MemoryEngine(InMemoryStore(), HashingEmbeddingProvider(dim=384))
 
 
 def resolve_security_context(
@@ -66,10 +82,12 @@ def create_app(
 ) -> FastAPI:
     settings = settings or ContextOSSettings()
     adapter = adapter or build_adapter(settings)
-    pipeline = Pipeline(adapter=adapter, default_model=settings.default_model)
+    memory = build_memory_engine(settings)
+    pipeline = Pipeline(adapter=adapter, memory=memory, default_model=settings.default_model)
 
     app = FastAPI(title="ContextOS", version="0.0.1")
     app.state.pipeline = pipeline
+    app.state.memory = memory
 
     @app.exception_handler(SecurityError)
     async def _security_error(_: Request, exc: SecurityError) -> JSONResponse:
@@ -97,6 +115,13 @@ def create_app(
             "usage": result.usage.model_dump(),
             "trace_id": result.trace_id,
         }
+
+    @app.post("/v1/memory")
+    async def write_memory(
+        body: MemoryBody, ctx: SecurityContext = Depends(resolve_security_context)
+    ) -> dict[str, Any]:
+        mem = await memory.write(ctx, body.content, tier=body.tier, importance=body.importance)
+        return {"id": mem.id, "tenant_id": mem.tenant_id, "namespace": mem.namespace, "tier": mem.tier.value}
 
     @app.get("/v1/traces/{trace_id}")
     async def get_trace(

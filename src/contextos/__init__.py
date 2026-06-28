@@ -18,7 +18,9 @@ import asyncio
 
 from .adapters.base import BackendAdapter
 from .config.settings import ContextOSSettings
-from .gateway.app import build_adapter
+from .gateway.app import build_adapter, build_memory_engine
+from .memory.engine import MemoryEngine
+from .models.common import MemoryTier
 from .pipeline import ChatResult, Pipeline
 from .security.context import SecurityContext
 
@@ -41,8 +43,10 @@ class ContextOS:
     ) -> None:
         self._settings = settings or ContextOSSettings()
         self._ctx = SecurityContext.resolve(tenant_id=tenant, user_id=user_id, namespace=namespace)
+        self._memory: MemoryEngine = build_memory_engine(self._settings)
         self._pipeline = Pipeline(
             adapter=adapter or build_adapter(self._settings),
+            memory=self._memory,
             default_model=self._settings.default_model,
         )
 
@@ -51,3 +55,9 @@ class ContextOS:
         return asyncio.run(
             self._pipeline.run(self._ctx, prompt, model=model, max_tokens=max_tokens, system=system)
         )
+
+    def remember(self, content: str, *, tier: MemoryTier = MemoryTier.SEMANTIC,
+                 importance: float = 0.5) -> str:
+        """Persist a memory for this user+tenant; returns its id. Later ``chat`` calls retrieve it."""
+        mem = asyncio.run(self._memory.write(self._ctx, content, tier=tier, importance=importance))
+        return mem.id

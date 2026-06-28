@@ -1,9 +1,9 @@
 """The request pipeline.
 
-Walking-skeleton scope: SecurityContext -> trace -> (memory/cache/assembly are explicit no-op
-stages, wired at Month 1) -> model router (single backend here) -> backend adapter -> response,
-with a decision record emitted at each stage. The *shape* is the deliverable: the stages and
-the trace/decision substrate exist now so Month 1 fills them in without restructuring.
+SecurityContext -> trace -> cache (no-op, Month 1) -> **memory retrieve (live when a
+MemoryEngine is wired)** -> assembly (no-op, Month 1) -> model router (single backend) ->
+backend adapter -> response, with a decision record per stage. Retrieved candidates are
+recorded on the trace now; prompt *injection* arrives with the Assembler (next Month-1 step).
 """
 
 from __future__ import annotations
@@ -11,6 +11,7 @@ from __future__ import annotations
 from pydantic import BaseModel
 
 from .adapters.base import BackendAdapter, ChatMessage, ChatRequest, Role, Usage
+from .memory.engine import MemoryEngine
 from .models.common import Action
 from .observability.tracer import Trace, Tracer
 from .security.context import SecurityContext
@@ -34,11 +35,13 @@ class Pipeline:
         adapter: BackendAdapter,
         tracer: Tracer | None = None,
         policy: PolicyEngine | None = None,
+        memory: MemoryEngine | None = None,
         default_model: str | None = None,
     ) -> None:
         self._adapter = adapter
         self._tracer = tracer or Tracer()
         self._policy = policy or PolicyEngine()
+        self._memory = memory
         self._default_model = default_model or "default"
 
     @property
@@ -67,7 +70,17 @@ class Pipeline:
         with trace.span("cache", "semantic-cache-lookup") as sp:
             Trace.record(sp, "miss (cache engine lands Month 1)", verdict="miss")
         with trace.span("retrieve", "memory-retrieve") as sp:
-            Trace.record(sp, "skipped (memory engine lands Month 1)", candidates="0")
+            if self._memory is not None:
+                candidates = await self._memory.retrieve(ctx, prompt, k=12)
+                top_ids = ",".join(c.memory_id for c in candidates[:5])
+                Trace.record(
+                    sp,
+                    f"retrieved {len(candidates)} candidate(s) (raw scores; assembler ranks next)",
+                    candidates=str(len(candidates)),
+                    top_memory_ids=top_ids,
+                )
+            else:
+                Trace.record(sp, "no memory engine configured", candidates="0")
         with trace.span("assemble", "context-assembly") as sp:
             Trace.record(sp, "passthrough (assembler lands Month 1)", budget="n/a")
 

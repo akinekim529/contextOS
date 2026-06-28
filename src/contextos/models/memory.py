@@ -30,16 +30,23 @@ class MemoryObject(BaseModel):
 
 
 class MemoryCandidate(BaseModel):
-    """A retrieval hit with raw, un-blended signals. The assembler blends + ranks these."""
+    """A retrieval hit carrying RAW per-modality signals only. The Context Assembler (s2.2)
+    computes the single final rank and does budget packing; the Memory Engine never blends
+    these into one downstream-ranking number (C1). ``rrf_score`` is an internal ordering
+    signal, reported for transparency/replay, not the final rank."""
 
     memory_id: str
     tenant_id: str
     namespace: str
-    content: str
     tier: MemoryTier
-    importance: float = 0.5
-    # raw per-modality scores — NOT a final rank (C1)
-    vector_score: float | None = None      # cosine similarity, pgvector
-    lexical_score: float | None = None      # BM25 / ts_rank
-    recency_score: float | None = None      # decay over last_accessed_at
-    raw_scores: dict[str, float] = Field(default_factory=dict)
+    content: str  # raw, pre-compression (compression runs AFTER ACL/redaction)
+    # --- raw per-modality signals (un-blended) ---
+    vector_score: float | None = None   # cosine in [0,1]; None if sparse-only hit
+    bm25_score: float | None = None      # lexical rank; None if dense-only hit
+    rrf_score: float = 0.0               # fusion rank score (internal ordering only)
+    recency_factor: float = 1.0          # exp half-life decay in (0,1]
+    importance: float = 0.5              # [0,1]
+    rank_in_dense: int | None = None     # 1-based; None if not in dense list
+    rank_in_sparse: int | None = None    # 1-based; None if not in sparse list
+    age_seconds: float = 0.0
+    source_ref: str | None = None        # READ-ONLY correlation
