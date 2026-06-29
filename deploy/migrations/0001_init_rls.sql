@@ -50,7 +50,8 @@ CREATE TABLE IF NOT EXISTS trace_spans (
     end_ts     TIMESTAMPTZ,
     attributes JSONB NOT NULL DEFAULT '{}'::jsonb,
     decision   JSONB,
-    PRIMARY KEY (trace_id, span_id)
+    -- Partitioned tables require the partition key (start_ts) in every unique/primary key.
+    PRIMARY KEY (trace_id, span_id, start_ts)
 ) PARTITION BY RANGE (start_ts);     -- time-partitioned to bound trace write-amplification
 
 ALTER TABLE trace_spans ENABLE ROW LEVEL SECURITY;
