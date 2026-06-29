@@ -1,0 +1,115 @@
+name: 🐛 Bug report
+description: Something in ContextOS behaves incorrectly (correctness, crash, wrong output).
+labels: ["bug", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. **Do not file security or tenant-isolation issues here** — use the
+        private security advisory link on the previous screen. For everything else, the more
+        reproducible the report, the faster the fix.
+
+        Tip: every request emits a `trace_id`. If you can include one, we can replay the exact
+        decision with the **Context Replay Debugger** — `GET /v1/traces/{trace_id}/replay`.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: A clear description of the bug and its impact.
+      placeholder: "`ctx.chat(...)` returned a 500 / the wrong memory was injected / ..."
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect to happen?
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: Numbered steps. A minimal repro is worth ten paragraphs.
+      placeholder: |
+        1. `ctx = ContextOS(user_id="u1", tenant="acme")`
+        2. `ctx.remember("...")`
+        3. `ctx.chat("...")`
+        4. observe ...
+    validations:
+      required: true
+  - type: textarea
+    id: snippet
+    attributes:
+      label: Minimal code / request
+      description: A self-contained snippet, curl command, or failing test. Secrets redacted.
+      render: python
+  - type: dropdown
+    id: area
+    attributes:
+      label: Affected area
+      options:
+        - Gateway / API
+        - Memory Engine (retrieval, write, decay)
+        - Context Assembler (ranking, budget, edge-loading)
+        - Semantic Cache
+        - Model Router
+        - RBAC firewall / tenant isolation (NON-security correctness only)
+        - Observability / Replay Debugger
+        - Python SDK
+        - Deployment / Helm / K8s
+        - Other / not sure
+    validations:
+      required: true
+  - type: dropdown
+    id: backend
+    attributes:
+      label: Backend adapter in use
+      options:
+        - vLLM
+        - OpenAI / Azure OpenAI
+        - Ollama
+        - TGI
+        - Fake / none (offline)
+        - Other (note in description)
+    validations:
+      required: true
+  - type: input
+    id: trace-id
+    attributes:
+      label: trace_id (if available)
+      description: Lets us replay the exact context decision. Omit if it contains nothing private.
+      placeholder: "01KW7..."
+  - type: input
+    id: version
+    attributes:
+      label: ContextOS version / commit
+      placeholder: "0.0.1 or git SHA"
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: OS, Python version, deploy mode (SDK in-process / gateway / K8s), stores in use.
+      placeholder: |
+        - OS: Ubuntu 24.04
+        - Python: 3.11.8
+        - Mode: gateway (uvicorn) / Postgres+pgvector + Redis
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs / traceback
+      render: shell
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I searched existing issues and this isn't a duplicate.
+          required: true
+        - label: This is NOT a security or cross-tenant isolation issue (those go through the private advisory link).
+          required: true
+        - label: I included a minimal reproduction (or explained why I can't).
+          required: true

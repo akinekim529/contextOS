@@ -1,0 +1,14 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 🔒 Security / tenant-isolation vulnerability
+    url: https://github.com/akinekim529/contextOS/security/advisories/new
+    about: >-
+      Report cross-tenant leakage, RBAC/RLS bypass, prompt-injection, secret exposure, or any
+      vulnerability PRIVATELY here — never in a public issue. Zero cross-tenant leakage is the
+      project's core guarantee; disclose it responsibly.
+  - name: 💬 Questions & ideas (Discussions)
+    url: https://github.com/akinekim529/contextOS/discussions
+    about: Usage questions, design discussion, and show-and-tell. Not sure if it's a bug? Start here.
+  - name: 📖 Design docs & roadmap
+    url: https://github.com/akinekim529/contextOS/tree/main/docs/design
+    about: Architecture, the seven module deep-dives, the canonical numbers, and the roadmap.
