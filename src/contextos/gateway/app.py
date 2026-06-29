@@ -21,11 +21,18 @@ from ..adapters.base import BackendAdapter
 from ..adapters.fake import FakeAdapter
 from ..adapters.openai_compatible import OpenAICompatibleAdapter
 from ..adapters.vllm import vllm_adapter
+from ..assembler.budget import ContextOverflow
+from ..assembler.engine import ContextAssembler
+from ..assembler.tokenizer import HeuristicTokenizer
+from ..cache.backend import InMemoryCacheBackend
+from ..cache.engine import SemanticCache
 from ..config.settings import ContextOSSettings
 from ..embedding.hashing import HashingEmbeddingProvider
 from ..memory.engine import MemoryEngine
 from ..models.common import MemoryTier
 from ..pipeline import Pipeline
+from ..replay.engine import ReplayDebugger
+from ..replay.store import InMemoryBundleStore
 from ..security.context import SecurityContext
 from ..security.errors import SecurityError
 from ..store.memory_store import InMemoryStore
@@ -63,6 +70,24 @@ def build_memory_engine(settings: ContextOSSettings) -> MemoryEngine:
     return MemoryEngine(InMemoryStore(), HashingEmbeddingProvider(dim=384))
 
 
+def build_assembler(settings: ContextOSSettings) -> ContextAssembler:
+    # Heuristic tokenizer + default RankWeights are applied by the Pipeline; the assembler only
+    # needs an embedder for MMR similarity. Production injects the model's real tokenizer.
+    return ContextAssembler(HashingEmbeddingProvider(dim=384))
+
+
+def build_cache(settings: ContextOSSettings) -> SemanticCache:
+    # Skeleton: in-memory two-tier cache + dependency-free embeddings. Production: Redis exact
+    # tier + pgvector semantic tier behind the same SemanticCache.
+    return SemanticCache(InMemoryCacheBackend(), HashingEmbeddingProvider(dim=384))
+
+
+def build_replay(settings: ContextOSSettings, assembler: ContextAssembler) -> ReplayDebugger:
+    # Reuses the pipeline's assembler (same deterministic embedder) so replay reproduces the exact
+    # assembled prompt. Production: two-phase write to DEK-sealed, content-addressed storage.
+    return ReplayDebugger(assembler, HeuristicTokenizer(), InMemoryBundleStore())
+
+
 def resolve_security_context(
     x_tenant_id: str | None = Header(default=None),
     x_user_id: str | None = Header(default=None),
@@ -83,15 +108,31 @@ def create_app(
     settings = settings or ContextOSSettings()
     adapter = adapter or build_adapter(settings)
     memory = build_memory_engine(settings)
-    pipeline = Pipeline(adapter=adapter, memory=memory, default_model=settings.default_model)
+    assembler = build_assembler(settings)
+    replay = build_replay(settings, assembler)
+    pipeline = Pipeline(
+        adapter=adapter,
+        memory=memory,
+        assembler=assembler,
+        cache=build_cache(settings),
+        replay=replay,
+        default_model=settings.default_model,
+        window_tokens=settings.default_token_budget,
+    )
 
     app = FastAPI(title="ContextOS", version="0.0.1")
     app.state.pipeline = pipeline
     app.state.memory = memory
+    app.state.replay = replay
 
     @app.exception_handler(SecurityError)
     async def _security_error(_: Request, exc: SecurityError) -> JSONResponse:
         return JSONResponse(status_code=403, content=envelope("access_denied", str(exc)))
+
+    @app.exception_handler(ContextOverflow)
+    async def _overflow(_: Request, exc: ContextOverflow) -> JSONResponse:
+        # Hard reserves don't fit the window -> fail closed (never truncate system/user).
+        return JSONResponse(status_code=413, content=envelope("context_overflow", str(exc)))
 
     @app.get("/healthz")
     async def healthz() -> dict[str, str]:
@@ -145,5 +186,27 @@ def create_app(
                 for s in trace.spans
             ],
         }
+
+    @app.get("/v1/traces/{trace_id}/replay")
+    async def replay_trace(
+        trace_id: str, ctx: SecurityContext = Depends(resolve_security_context)
+    ) -> dict[str, Any]:
+        result = await replay.replay(ctx, trace_id)
+        if result is None:
+            return JSONResponse(  # type: ignore[return-value]
+                status_code=404, content=envelope("not_found", "no replay bundle for trace", trace_id)
+            )
+        return result.model_dump()
+
+    @app.get("/v1/traces/{trace_id}/bundle")
+    async def get_bundle(
+        trace_id: str, ctx: SecurityContext = Depends(resolve_security_context)
+    ) -> dict[str, Any]:
+        bundle = replay.get(ctx, trace_id)
+        if bundle is None:
+            return JSONResponse(  # type: ignore[return-value]
+                status_code=404, content=envelope("not_found", "no bundle for trace", trace_id)
+            )
+        return bundle.model_dump(mode="json")
 
     return app
