@@ -1,0 +1,36 @@
+name: 📖 Documentation
+description: A docs problem — wrong, unclear, missing, or a broken link.
+labels: ["documentation", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Docs live in `docs/design/` (architecture + module deep-dives), `docs/adr/` (decisions),
+        plus `README.md`, `CONTRIBUTING.md`, and `START_HERE.md`.
+  - type: input
+    id: where
+    attributes:
+      label: Which page / file
+      placeholder: "docs/design/02-module-deep-dive/2.1-memory-engine.md, README.md, ..."
+    validations:
+      required: true
+  - type: dropdown
+    id: kind
+    attributes:
+      label: Type of issue
+      options:
+        - Incorrect / outdated
+        - Unclear / confusing
+        - Missing content
+        - Broken link
+        - Inconsistent number or claim across docs
+        - Typo / formatting
+    validations:
+      required: true
+  - type: textarea
+    id: detail
+    attributes:
+      label: What's wrong, and what would be correct?
+      description: Quote the passage if you can, and suggest the fix.
+    validations:
+      required: true

@@ -1,0 +1,66 @@
+name: ✨ Feature request
+description: Propose a capability or improvement for ContextOS.
+labels: ["enhancement", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ContextOS has deliberate **scope boundaries**: it is middleware, not an inference engine,
+        not a vector database, not a model-training system, and not a general agent framework. The
+        strongest proposals make the context decision better; the ones that ask ContextOS to *become*
+        one of those systems are out of scope (we integrate instead). See `docs/design/`.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem / motivation
+      description: What can't you do today, or what's painful? Describe the use case, not just the fix.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: What should ContextOS do? An API/SDK sketch or interface signature helps a lot.
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Which area
+      options:
+        - Memory Engine
+        - Context Assembler
+        - Semantic Cache
+        - Model Router
+        - RBAC firewall / multi-tenancy
+        - Observability / Replay
+        - Killer feature (cost dashboard, memory versioning, context diff, ...)
+        - Python SDK / REST API
+        - Deployment / Helm / K8s
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Other approaches, existing tools, or why a workaround isn't enough.
+  - type: dropdown
+    id: contribute
+    attributes:
+      label: Would you be willing to contribute this?
+      options:
+        - "Yes, I'd like to implement it"
+        - "Yes, with guidance"
+        - "No, requesting only"
+    validations:
+      required: true
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I searched existing issues and discussions.
+          required: true
+        - label: This stays within ContextOS's scope (a context-layer capability, not a re-implementation of an inference engine / vector DB / agent framework).
+          required: true

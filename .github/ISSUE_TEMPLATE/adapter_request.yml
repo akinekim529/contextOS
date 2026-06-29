@@ -1,0 +1,72 @@
+name: 🔌 Backend adapter request
+description: Request support for a new LLM inference backend behind the BackendAdapter interface.
+labels: ["adapter", "enhancement", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ContextOS is backend-agnostic: vLLM, OpenAI/Azure, Ollama, and TGI already sit behind one
+        `BackendAdapter` (`generate` / `stream` / `health_check` / `capabilities`). Most new backends
+        that speak the OpenAI-compatible wire format need only configuration, not a new adapter — try
+        `backend_kind: openai` with a custom `base_url` first.
+  - type: input
+    id: backend
+    attributes:
+      label: Backend name
+      placeholder: "e.g. SGLang, LM Studio, Bedrock, Together"
+    validations:
+      required: true
+  - type: input
+    id: link
+    attributes:
+      label: API / docs link
+    validations:
+      required: true
+  - type: dropdown
+    id: wire
+    attributes:
+      label: API shape
+      options:
+        - OpenAI-compatible (/v1/chat/completions)
+        - Custom REST
+        - gRPC
+        - SDK only (no HTTP)
+        - Not sure
+    validations:
+      required: true
+  - type: dropdown
+    id: streaming
+    attributes:
+      label: Does it support token streaming?
+      options:
+        - "Yes (SSE)"
+        - "Yes (other)"
+        - "No"
+        - "Not sure"
+    validations:
+      required: true
+  - type: checkboxes
+    id: features
+    attributes:
+      label: Relevant capabilities
+      options:
+        - label: Exposes a prefix / KV-cache reuse mechanism (helps ContextOS build stable prompt prefixes)
+        - label: Reports token usage in responses
+        - label: Supports a system prompt / system role
+  - type: textarea
+    id: why
+    attributes:
+      label: Why this backend?
+      description: Your use case and rough scale (req/s, models, self-hosted vs hosted).
+    validations:
+      required: true
+  - type: dropdown
+    id: contribute
+    attributes:
+      label: Would you contribute the adapter?
+      options:
+        - "Yes, I'd like to implement it"
+        - "Yes, with guidance"
+        - "No, requesting only"
+    validations:
+      required: true

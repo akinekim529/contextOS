@@ -1,1 +1,107 @@
+name: CI
 
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    name: lint • types • tests (py${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+
+      - name: Install (package + dev tools)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Ruff (lint)
+        run: ruff check src tests
+
+      - name: Mypy (strict types)
+        run: mypy
+
+      - name: Pytest — unit + tenant-isolation gate (>=10k hostile probes)
+        run: pytest -m "not integration" -q
+
+  integration:
+    name: integration • Postgres RLS backstop
+    runs-on: ubuntu-latest
+    # The app-layer leakage gate in `quality` is the ENFORCED hard gate. This job validates the
+    # database backstop (Postgres FORCE RLS) against a real server. It is non-blocking until
+    # verified in your environment — once it goes green, delete `continue-on-error` to require it.
+    continue-on-error: true
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: contextos
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install (psql client + package)
+        run: |
+          sudo apt-get update && sudo apt-get install -y postgresql-client
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Apply schema (RLS + pgvector) and create a NON-superuser app role
+        # RLS is only meaningful for a non-superuser — superusers bypass row-level security.
+        env:
+          PGPASSWORD: postgres
+        run: |
+          psql -h localhost -U postgres -d contextos -v ON_ERROR_STOP=1 \
+            -f deploy/migrations/0001_init_rls.sql
+          psql -h localhost -U postgres -d contextos -v ON_ERROR_STOP=1 -c "
+            CREATE ROLE contextos_app LOGIN PASSWORD 'app';
+            GRANT USAGE ON SCHEMA public TO contextos_app;
+            GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO contextos_app;
+          "
+
+      - name: Pytest — integration (cross-tenant SELECT must be blocked by RLS)
+        env:
+          CONTEXTOS_POSTGRES_DSN: postgresql://contextos_app:app@localhost:5432/contextos
+          CONTEXTOS_REDIS_URL: redis://localhost:6379/0
+        run: pytest -m integration -q

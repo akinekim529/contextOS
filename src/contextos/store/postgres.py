@@ -11,11 +11,17 @@ a database driver. This backend is exercised by ``tests/integration/`` against a
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from ..models.common import EmbeddingRef, MemoryTier, Provenance
 from ..models.memory import MemoryObject
 from ..security.context import SecurityContext
+
+
+async def _register_jsonb_codec(conn: Any) -> None:  # pragma: no cover - integration only
+    # asyncpg has no built-in dict<->jsonb codec; register one so we pass/return plain dicts.
+    await conn.set_type_codec("jsonb", encoder=json.dumps, decoder=json.loads, schema="pg_catalog")
 
 
 class PostgresStore:  # pragma: no cover - exercised only by the integration suite (needs a DB)
@@ -26,7 +32,9 @@ class PostgresStore:  # pragma: no cover - exercised only by the integration sui
     async def connect(self) -> None:
         import asyncpg  # lazy: optional dependency
 
-        self._pool = await asyncpg.create_pool(self._dsn, min_size=1, max_size=10)
+        self._pool = await asyncpg.create_pool(
+            self._dsn, min_size=1, max_size=10, init=_register_jsonb_codec
+        )
 
     async def _scoped_conn(self, ctx: SecurityContext) -> tuple[Any, Any]:
         if self._pool is None:
@@ -50,7 +58,7 @@ class PostgresStore:  # pragma: no cover - exercised only by the integration sui
                 """,
                 memory.id, memory.tenant_id, memory.namespace, memory.tier.value, memory.content,
                 memory.importance, memory.created_at, memory.last_accessed_at,
-                memory.provenance.model_dump_json(), memory.metadata,
+                memory.provenance.model_dump(mode="json"), memory.metadata,
             )
             await tx.commit()
             return memory
@@ -89,7 +97,7 @@ class PostgresStore:  # pragma: no cover - exercised only by the integration sui
             id=row["id"], tenant_id=row["tenant_id"], namespace=row["namespace"],
             tier=MemoryTier(row["tier"]), content=row["content"], importance=row["importance"],
             created_at=row["created_at"], last_accessed_at=row["last_accessed_at"],
-            provenance=Provenance.model_validate_json(row["provenance"]),
+            provenance=Provenance.model_validate(row["provenance"]),
             embedding_ref=(
                 EmbeddingRef(collection="memories", vector_id=row["id"]) if row.get("embedding_ref") else None
             ),
