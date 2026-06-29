@@ -22,6 +22,7 @@ from .gateway.app import (
     build_adapter,
     build_assembler,
     build_cache,
+    build_compressor,
     build_memory_engine,
     build_replay,
 )
@@ -58,6 +59,7 @@ class ContextOS:
             memory=self._memory,
             assembler=assembler,
             cache=build_cache(self._settings),
+            compressor=build_compressor(self._settings),
             replay=self._replay,
             default_model=self._settings.default_model,
             window_tokens=self._settings.default_token_budget,

@@ -26,6 +26,7 @@ from ..assembler.engine import ContextAssembler
 from ..assembler.tokenizer import HeuristicTokenizer
 from ..cache.backend import InMemoryCacheBackend
 from ..cache.engine import SemanticCache
+from ..compressor.engine import ContextCompressor
 from ..config.settings import ContextOSSettings
 from ..embedding.hashing import HashingEmbeddingProvider
 from ..memory.engine import MemoryEngine
@@ -82,6 +83,11 @@ def build_cache(settings: ContextOSSettings) -> SemanticCache:
     return SemanticCache(InMemoryCacheBackend(), HashingEmbeddingProvider(dim=384))
 
 
+def build_compressor(settings: ContextOSSettings) -> ContextCompressor:
+    # Hot path uses the deterministic structural+extractive tiers; abstractive (LLM) is opt-in.
+    return ContextCompressor()
+
+
 def build_replay(settings: ContextOSSettings, assembler: ContextAssembler) -> ReplayDebugger:
     # Reuses the pipeline's assembler (same deterministic embedder) so replay reproduces the exact
     # assembled prompt. Production: two-phase write to DEK-sealed, content-addressed storage.
@@ -115,6 +121,7 @@ def create_app(
         memory=memory,
         assembler=assembler,
         cache=build_cache(settings),
+        compressor=build_compressor(settings),
         replay=replay,
         default_model=settings.default_model,
         window_tokens=settings.default_token_budget,
