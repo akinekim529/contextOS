@@ -23,6 +23,7 @@ from .compressor.engine import ContextCompressor
 from .memory.engine import MemoryEngine
 from .models.common import Action
 from .models.memory import MemoryCandidate
+from .observability.cost import CostLedger
 from .observability.tracer import Trace, Tracer
 from .replay.bundle import BundleMessage, render_prompt_hash
 from .replay.engine import ReplayDebugger
@@ -58,6 +59,7 @@ class Pipeline:
         replay: ReplayDebugger | None = None,
         router: ModelRouter | None = None,
         backends: BackendRegistry | None = None,
+        cost: CostLedger | None = None,
         default_model: str | None = None,
         window_tokens: int = 6000,
         compress_target_tokens: int = 256,
@@ -74,6 +76,7 @@ class Pipeline:
         self._replay = replay
         self._router = router
         self._backends = backends
+        self._cost = cost
         self._default_model = default_model or "default"
         self._compress_target = compress_target_tokens
         self._window_tokens = window_tokens
@@ -262,6 +265,8 @@ class Pipeline:
             # Phase-2 bundle completion attach — only on a server terminal event (C8).
             if self._replay is not None and committed:
                 self._replay.attach_output(ctx, trace.trace_id, resp.text)
+            if self._cost is not None and committed:
+                self._cost.record(ctx, chosen_model, resp.usage)
             Trace.record(
                 sp,
                 "committed" if committed else "discarded (no terminal event)",

@@ -156,3 +156,26 @@ def test_hard_reserve_overflow_returns_413() -> None:
     assert r.status_code == 413
     assert r.json()["error"]["type"] == "context_overflow"
 
+
+def test_admin_cost_and_memory_versioning_endpoints() -> None:
+    client = TestClient(create_app(adapter=FakeAdapter("ok")))
+    h = {"X-Tenant-Id": "acme", "X-User-Id": "42"}
+    client.post("/v1/chat", json={"prompt": "hello world"}, headers=h)
+    cost = client.get("/v1/admin/cost", headers=h).json()
+    assert cost["tenant_id"] == "acme" and cost["requests"] >= 1
+
+    client.post("/v1/memory", json={"content": "fact A"}, headers=h)
+    c1 = client.post("/v1/admin/memory/commit", json={"label": "first"}, headers=h).json()["cid"]
+    client.post("/v1/memory", json={"content": "fact B"}, headers=h)
+    c2 = client.post("/v1/admin/memory/commit", json={}, headers=h).json()["cid"]
+    diff = client.get(f"/v1/admin/memory/diff?a={c1}&b={c2}", headers=h).json()
+    assert len(diff["added"]) == 1
+
+
+def test_otel_export_endpoint() -> None:
+    client = TestClient(create_app(adapter=FakeAdapter("ok")))
+    h = {"X-Tenant-Id": "acme", "X-User-Id": "1"}
+    tid = client.post("/v1/chat", json={"prompt": "hi"}, headers=h).json()["trace_id"]
+    otel = client.get(f"/v1/traces/{tid}/otel", headers=h).json()
+    assert otel["resourceSpans"][0]["scopeSpans"][0]["spans"]
+

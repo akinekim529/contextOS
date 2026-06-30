@@ -1,0 +1,3 @@
+# Default owner for everything. With "Require review from Code Owners" on the protected branch,
+# nothing merges to that branch without the owner's approval.
+*       @akinekim529

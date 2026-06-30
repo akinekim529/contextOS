@@ -10,6 +10,7 @@ real call is made.
 
 from __future__ import annotations
 
+import json
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -33,6 +34,7 @@ class OpenAICompatibleAdapter:
         name: str = "openai-compatible",
         prefix_cache: bool = False,
         timeout_s: float = 60.0,
+        transport: Any | None = None,
     ) -> None:
         self.name = name
         self._base_url = base_url.rstrip("/")
@@ -40,6 +42,7 @@ class OpenAICompatibleAdapter:
         self._api_key = api_key
         self._prefix_cache = prefix_cache
         self._timeout_s = timeout_s
+        self._transport = transport  # injectable httpx transport (tests / proxies / mTLS)
 
     def capabilities(self) -> Capabilities:
         return Capabilities(streaming=True, prefix_cache=self._prefix_cache)
@@ -63,7 +66,7 @@ class OpenAICompatibleAdapter:
         import httpx
 
         try:
-            async with httpx.AsyncClient(timeout=5.0) as client:
+            async with httpx.AsyncClient(timeout=5.0, transport=self._transport) as client:
                 r = await client.get(f"{self._base_url}/v1/models", headers=self._headers())
                 return r.status_code < 500
         except Exception:
@@ -72,7 +75,7 @@ class OpenAICompatibleAdapter:
     async def generate(self, req: ChatRequest) -> ChatResponse:
         import httpx
 
-        async with httpx.AsyncClient(timeout=self._timeout_s) as client:
+        async with httpx.AsyncClient(timeout=self._timeout_s, transport=self._transport) as client:
             r = await client.post(
                 f"{self._base_url}/v1/chat/completions",
                 headers=self._headers(),
@@ -96,7 +99,7 @@ class OpenAICompatibleAdapter:
     async def stream(self, req: ChatRequest) -> AsyncIterator[StreamEvent]:
         import httpx
 
-        async with httpx.AsyncClient(timeout=self._timeout_s) as client:
+        async with httpx.AsyncClient(timeout=self._timeout_s, transport=self._transport) as client:
             async with client.stream(
                 "POST",
                 f"{self._base_url}/v1/chat/completions",
@@ -112,8 +115,6 @@ class OpenAICompatibleAdapter:
                         # Server-side terminal event — safe to commit write-back (C8).
                         yield StreamEvent(type=StreamEventType.DONE, finish_reason="stop")
                         return
-                    import json
-
                     delta = json.loads(chunk)["choices"][0]
                     content = delta.get("delta", {}).get("content")
                     if content:

@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, main-dev]
   pull_request:
-    branches: [main]
+    branches: [main, main-dev]
 
 permissions:
   contents: read
@@ -42,6 +42,19 @@ jobs:
 
       - name: Pytest — unit + tenant-isolation gate (>=10k hostile probes)
         run: pytest -m "not integration" -q
+
+      - name: No-placeholder gate (zero TODO/dummy/NotImplementedError in shipped code)
+        run: |
+          if grep -rnE "TODO|FIXME|XXX|dummy|placeholder|NotImplementedError|raise NotImplemented" \
+               src docs examples; then
+            echo "::error::placeholder text found in shipped code/docs" && exit 1
+          fi
+          echo "no placeholders found"
+
+      - name: Examples run offline
+        run: |
+          python examples/quickstart.py
+          python examples/replay_demo.py
 
   integration:
     name: integration • Postgres RLS backstop

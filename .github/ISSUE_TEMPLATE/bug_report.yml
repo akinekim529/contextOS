@@ -1,5 +1,6 @@
 name: 🐛 Bug report
 description: Something in ContextOS behaves incorrectly (correctness, crash, wrong output).
+title: "[Bug]: "
 labels: ["bug", "needs-triage"]
 body:
   - type: markdown

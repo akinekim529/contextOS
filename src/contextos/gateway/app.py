@@ -11,6 +11,7 @@ the request is denied before any work happens (fail-closed).
 
 from __future__ import annotations
 
+from dataclasses import asdict
 from typing import Any
 
 from fastapi import Depends, FastAPI, Header, Request
@@ -31,12 +32,16 @@ from ..config.settings import ContextOSSettings
 from ..embedding.hashing import HashingEmbeddingProvider
 from ..memory.engine import MemoryEngine
 from ..models.common import MemoryTier
+from ..observability.cost import CostLedger
+from ..observability.otel import to_otlp
 from ..pipeline import Pipeline
+from ..replay.diff import diff_bundles
 from ..replay.engine import ReplayDebugger
 from ..replay.store import InMemoryBundleStore
 from ..security.context import SecurityContext
 from ..security.errors import SecurityError
 from ..store.memory_store import InMemoryStore
+from ..versioning.engine import MemoryVersioning, UnknownCommit
 from .errors import envelope
 
 
@@ -51,6 +56,15 @@ class MemoryBody(BaseModel):
     content: str
     tier: MemoryTier = MemoryTier.SEMANTIC
     importance: float = 0.5
+
+
+class CommitBody(BaseModel):
+    label: str = ""
+    branch: str = "main"
+
+
+class RollbackBody(BaseModel):
+    cid: str
 
 
 def build_adapter(settings: ContextOSSettings) -> BackendAdapter:
@@ -88,6 +102,14 @@ def build_compressor(settings: ContextOSSettings) -> ContextCompressor:
     return ContextCompressor()
 
 
+def build_cost_ledger(settings: ContextOSSettings) -> CostLedger:
+    return CostLedger()
+
+
+def build_versioning(memory: MemoryEngine) -> MemoryVersioning:
+    return MemoryVersioning(memory)
+
+
 def build_replay(settings: ContextOSSettings, assembler: ContextAssembler) -> ReplayDebugger:
     # Reuses the pipeline's assembler (same deterministic embedder) so replay reproduces the exact
     # assembled prompt. Production: two-phase write to DEK-sealed, content-addressed storage.
@@ -116,6 +138,8 @@ def create_app(
     memory = build_memory_engine(settings)
     assembler = build_assembler(settings)
     replay = build_replay(settings, assembler)
+    cost = build_cost_ledger(settings)
+    versioning = build_versioning(memory)
     pipeline = Pipeline(
         adapter=adapter,
         memory=memory,
@@ -123,14 +147,17 @@ def create_app(
         cache=build_cache(settings),
         compressor=build_compressor(settings),
         replay=replay,
+        cost=cost,
         default_model=settings.default_model,
         window_tokens=settings.default_token_budget,
     )
 
-    app = FastAPI(title="ContextOS", version="0.0.1")
+    app = FastAPI(title="ContextOS", version="0.1.0")
     app.state.pipeline = pipeline
     app.state.memory = memory
     app.state.replay = replay
+    app.state.cost = cost
+    app.state.versioning = versioning
 
     @app.exception_handler(SecurityError)
     async def _security_error(_: Request, exc: SecurityError) -> JSONResponse:
@@ -215,5 +242,66 @@ def create_app(
                 status_code=404, content=envelope("not_found", "no bundle for trace", trace_id)
             )
         return bundle.model_dump(mode="json")
+
+    @app.get("/v1/admin/cost")
+    async def admin_cost(ctx: SecurityContext = Depends(resolve_security_context)) -> dict[str, Any]:
+        return asdict(cost.summary(ctx))
+
+    @app.post("/v1/admin/memory/commit")
+    async def memory_commit(
+        body: CommitBody, ctx: SecurityContext = Depends(resolve_security_context)
+    ) -> dict[str, Any]:
+        cid = await versioning.commit(ctx, body.label, branch=body.branch)
+        return {"cid": cid, "branch": body.branch}
+
+    @app.get("/v1/admin/memory/branches")
+    async def memory_branches(
+        ctx: SecurityContext = Depends(resolve_security_context),
+    ) -> dict[str, Any]:
+        return {"branches": versioning.branches(ctx)}
+
+    @app.get("/v1/admin/memory/diff")
+    async def memory_diff(
+        a: str, b: str, ctx: SecurityContext = Depends(resolve_security_context)
+    ) -> dict[str, Any]:
+        try:
+            return asdict(versioning.diff(ctx, a, b))
+        except UnknownCommit:
+            return JSONResponse(  # type: ignore[return-value]
+                status_code=404, content=envelope("not_found", "unknown commit")
+            )
+
+    @app.post("/v1/admin/memory/rollback")
+    async def memory_rollback(
+        body: RollbackBody, ctx: SecurityContext = Depends(resolve_security_context)
+    ) -> dict[str, Any]:
+        try:
+            return {"restored": await versioning.rollback(ctx, body.cid)}
+        except UnknownCommit:
+            return JSONResponse(  # type: ignore[return-value]
+                status_code=404, content=envelope("not_found", "unknown commit")
+            )
+
+    @app.get("/v1/admin/trace-diff")
+    async def trace_diff(
+        a: str, b: str, ctx: SecurityContext = Depends(resolve_security_context)
+    ) -> dict[str, Any]:
+        ba, bb = replay.get(ctx, a), replay.get(ctx, b)
+        if ba is None or bb is None:
+            return JSONResponse(  # type: ignore[return-value]
+                status_code=404, content=envelope("not_found", "unknown trace bundle")
+            )
+        return asdict(diff_bundles(ba, bb))
+
+    @app.get("/v1/traces/{trace_id}/otel")
+    async def trace_otel(
+        trace_id: str, ctx: SecurityContext = Depends(resolve_security_context)
+    ) -> dict[str, Any]:
+        trace = pipeline.tracer.get(ctx, trace_id)
+        if trace is None:
+            return JSONResponse(  # type: ignore[return-value]
+                status_code=404, content=envelope("not_found", "trace not found", trace_id)
+            )
+        return to_otlp(trace.spans)
 
     return app
