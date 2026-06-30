@@ -185,6 +185,12 @@ scales on the *cause* (QPS, stream depth), CPU HPA scales on the *symptom*. KEDA
 also gives us **scale-to-floor (not zero)** for stateful-ish services with model
 cold-start.
 
+**No ContextOS Deployment autoscales on GPU pressure**: vLLM `gpu_cache_usage_perc`,
+`num_requests_running`, and `num_requests_waiting` are a **routing input only** (an
+optimization signal the router folds into the route decision, Section 5) and are
+**never** wired to any KEDA `ScaledObject` — scaling ContextOS replicas on GPU/KV
+telemetry would make us an inference-capacity controller, which we are not (C13).
+
 | Deployment | KEDA trigger | Metric source | Why this signal |
 |---|---|---|---|
 | **gateway** | **QPS** | Prometheus `sum(rate(http_requests_total[1m]))` per replica | Gateway is hot-path CPU-bound at ~0.7 vCPU per 1k req/s; one node sustains 5k–10k req/s. QPS is the direct driver of proxy+assembly CPU. |
@@ -303,13 +309,156 @@ concern, surfaced to us only as telemetry.
 
 ---
 
+## Prompt forwarding to vLLM
+
+Once the router emits a `RouteDecision` (Section 5), the gateway forwards the
+**packed prompt** to the chosen vLLM replica through the one wire abstraction
+every backend hides behind — the `OpenAICompatibleAdapter`'s
+`POST /v1/chat/completions` (vLLM, TGI, Ollama, and the OpenAI API all speak this
+exact format, so a backend swap is config, not code). The deployment-level op
+sequence mirrors the real adapter (`src/contextos/adapters/openai_compatible.py`):
+
+```
+1. router.route(req)            -> RouteDecision{ backend, model_id, fallback_chain, ... }
+2. replica = backend_pool.pick(RouteDecision.backend)   # one healthy vLLM replica behind the backend Service
+3. payload = adapter._payload(packed_req, stream=True)  # {model: model_id, messages, max_tokens, temperature, stream}
+4. POST http://<replica>/v1/chat/completions
+     headers: { Content-Type: application/json, Authorization: Bearer <key?> }
+     json:    payload
+     timeout: deadline_remaining_ms                     # request deadline, NOT a fixed 60s, on the hot path
+5. on connect error / 5xx / breaker-open -> next backend in RouteDecision.fallback_chain (C9)
+6. r.aiter_lines() -> SSE `data:` chunks -> streaming write-back tee (next subsection)
+```
+
+The packed prompt produced by the assembler/compressor is sent verbatim as the
+OpenAI `messages` array — system + long-lived memory first (stable prefix for
+vLLM prefix-cache reuse, `prefix_cache=True`), volatile turn last — and `model`
+is set to `RouteDecision.model_id`, never the client's requested alias. Example
+request payload to a chosen replica:
+
+```json
+POST http://vllm-a-7f9c.vllm.svc:8000/v1/chat/completions
+Content-Type: application/json
+Authorization: Bearer sk-internal-...
+{
+  "model": "meta-llama/Llama-3.1-8B-Instruct",
+  "messages": [
+    { "role": "system", "content": "You are a support agent for ACME. [tenant: t_8a31]" },
+    { "role": "system", "content": "[memory] Customer SLA tier: gold; prior ticket #4471 resolved 2026-06-12." },
+    { "role": "user", "content": "Has my refund for order 88120 been processed?" }
+  ],
+  "max_tokens": 512,
+  "temperature": 0.7,
+  "stream": true
+}
+```
+
+**Dispatch overhead.** The forward is a single keep-alive HTTP/1.1 round-trip to
+an in-cluster replica: JSON serialization of a ≤ a-few-KB `messages` array plus
+connection acquisition from a pooled `httpx.AsyncClient`. Measured gateway-side
+dispatch cost (serialize + in-cluster connect, excluding model time-to-first-token)
+is **≤ 3 ms p95**, well inside the **< 250 ms p95 total control overhead** budget —
+the gateway's own pipeline (assembly < 50 ms, retrieval < 100 ms) dominates, and
+dispatch is < 2% of it. The model's generation latency is **not** counted against
+the control-overhead budget; only ContextOS's own work is.
+
+**Rejected alternative: forward via the official OpenAI Python SDK to every
+backend.** The `openai` SDK assumes OpenAI/Azure-shaped responses and bakes in
+retry/backoff, `usage` parsing, and error taxonomies that diverge across backends:
+**Ollama** streams `done`/`eval_count` fields and omits or reshapes `usage`,
+**TGI**'s OpenAI router has historically differed on `finish_reason` values and
+SSE framing, and the SDK's client object is heavier to pool per-replica than a raw
+`httpx` POST. Hiding all four backends behind one thin `httpx` adapter we control —
+exactly `OpenAICompatibleAdapter` — lets us handle each backend's SSE quirks in one
+audited place and keep the per-request object cheap enough to stay under the 3 ms
+dispatch budget. The SDK would couple our hot path to a third party's release
+cadence and its OpenAI-centric assumptions.
+
+---
+
+## Streaming write-back tee
+
+vLLM streams the completion back as SSE `data:` chunks. The gateway **tees** each
+chunk three ways in a single pass so first-token latency is never paid twice. The
+op sequence (mirrors `OpenAICompatibleAdapter.stream` token extraction):
+
+```
+for each `data:` line from vLLM SSE:
+    if line == "data: [DONE]":                      # server-side terminal event (C8)
+        seal()                                       # see below
+        break
+    delta = json.loads(chunk)["choices"][0]["delta"].get("content")
+    if delta:
+        tee #1  -> forward delta to the CLIENT's SSE response immediately   (protects TTFT)
+        tee #2  -> append delta to an in-process accumulating buffer        (full assistant text)
+        tee #3  -> (cheap) running token count + last-chunk usage capture   (for cost seal)
+
+seal()  # runs once, on stream-close:
+    if terminal == "[DONE]"/finish_reason set:       # COMPLETE turn
+        enqueue write-back -> redis stream "contextos:writeback"  (assistant text + turn metadata)
+        enqueue cost-seal  -> Postgres FAIL-CLOSED outbox         (CostRecord, drained by worker, C12)
+    else:                                            # MID-STREAM FAILURE (vLLM 5xx / connection drop)
+        enqueue write-back of the PARTIAL assistant text accumulated so far, flagged partial=true
+        enqueue PARTIAL cost-seal: prompt_tokens (known) + completion_tokens = tokens streamed so far
+```
+
+The key invariant: tee #1 (client) is written **before** tees #2/#3 do any
+accumulation work for that chunk, so the client sees each token the instant it
+arrives. Write-back and the cost seal are **enqueued, never awaited inline** —
+they land on the Redis Streams async plane and the fail-closed Postgres cost
+outbox, drained by the worker Deployment off the hot path (Section 8.2). A
+**client abort** before the terminal event discards the generation (C8); a
+**backend mid-stream failure** is different — the tokens already produced are real
+and billable, so the partial turn **and** its partial cost are persisted, never
+silently dropped.
+
+Example vLLM SSE chunk (one token of the stream tee'd to all three sinks):
+
+```
+data: {"id":"chatcmpl-3f1","object":"chat.completion.chunk","model":"meta-llama/Llama-3.1-8B-Instruct","choices":[{"index":0,"delta":{"content":"Yes"},"finish_reason":null}]}
+```
+
+Mid-stream-failure persistence example — vLLM drops the connection after 7 tokens
+("Yes, your refund for order"); the seal enqueues a partial record rather than
+losing it:
+
+```json
+// enqueued to contextos:writeback  (partial turn)
+{ "tenant_id": "t_8a31", "turn_id": "turn_91c4", "role": "assistant",
+  "content": "Yes, your refund for order", "partial": true,
+  "reason": "backend_stream_drop" }
+
+// enqueued to the FAIL-CLOSED Postgres cost outbox  (partial cost — billable tokens are real)
+{ "tenant_id": "t_8a31", "model_id": "meta-llama/Llama-3.1-8B-Instruct",
+  "prompt_tokens": 214, "completion_tokens": 7, "cost_usd": 0.000044, "partial": true }
+```
+
+The cost figure is computed exactly as the built `CostLedger.record` does
+(`price_per_1k(model_id) * (prompt_tokens + completion_tokens) / 1000`, rounded to
+6 dp) — at `meta-llama/Llama-3.1-8B-Instruct` = $0.0002/1k that is
+`0.0002 * 221 / 1000 = $0.000044`. A dropped cost record corrupts the budget
+ledger that routing-budget filters and consolidation depend on, so this path is
+**fail-closed**.
+
+**Rejected alternative: buffer-then-write** — accumulate the entire completion in
+memory, then send it to the client and write back in one shot after the terminal
+event. This **breaks first-token latency**: the client would wait for the *whole*
+generation (hundreds of ms to seconds for a long completion) before seeing a single
+token, turning a streaming endpoint into a blocking one and blowing the perceived
+TTFT for no benefit. It also loses the partial turn on mid-stream failure — there is
+no accumulated-and-forwarded text to fall back to because nothing was forwarded.
+The tee pays one cheap buffer-append per chunk on top of the forward we are already
+doing, and that append is off the client's critical token path.
+
+---
+
 ## 6. Backing-Store Choices
 
 | Store | Role | Operator / form | Rejected alternative | Why rejected |
 |---|---|---|---|---|
 | **Redis** | Exact-hash cache tier (< 1 ms p99), Redis Streams async plane (= replay log), working/short-term memory (TTL), KEDA queue signal | Redis Operator (or managed), **AOF on**, per-tenant key namespacing | Kafka for the async plane | Kafka is a heavyweight distributed log we don't need at launch scale; Redis Streams gives us at-least-once consumer groups, sub-ms enqueue (2 ms write-back enqueue, Section 9), and doubles as the **replay log** in one system. We keep Kafka as a future cutover, not a launch dependency. |
 | **Postgres 16 + pgvector** | Relational truth (tenant_id partition key, FORCE RLS), long-term/episodic/semantic memory, **co-located HNSW vectors** (18 ms p95 ANN probe), semantic-cache ANN tier | **CloudNativePG operator**, PITR | Standalone vector DB (Pinecone/Weaviate) from day one | Co-locating vectors **inside** Postgres means one tenant-isolation mechanism (RLS), one transaction for "row + its embedding," one backup/PITR story, and one place to crypto-shred on RTBF (C11). A separate vector DB doubles the isolation surface and creates write-skew between row and vector. pgvector HNSW holds 18 ms p95 to ≤5M vectors/tenant. |
-| **Qdrant** | **Escape hatch** only — engaged when a tenant exceeds ~5M vectors and pgvector ANN risks crossing 18 ms p95 | Optional StatefulSet / managed, behind the `VectorStore` adapter | Default to Qdrant for everyone | Defaulting to Qdrant pays the dual-store isolation cost for every tenant to solve a problem only the largest few have. Behind the adapter, cutover is per-tenant config; Qdrant holds the vector query ≤ 25 ms p95 beyond launch scale. |
+| **Qdrant** | **Escape hatch** only — engaged when a tenant exceeds ~5M vectors and pgvector ANN risks crossing 18 ms p95 | Optional StatefulSet / managed, behind the `VectorStore` adapter | Default to Qdrant for everyone; **Milvus** as the escape-hatch store | Defaulting to Qdrant pays the dual-store isolation cost for every tenant to solve a problem only the largest few have. Behind the adapter, cutover is per-tenant config; Qdrant holds the vector query ≤ 25 ms p95 beyond launch scale. **Milvus is rejected by name**: at our escape-hatch scale (≤ 5M vectors/tenant) Milvus's distributed topology — a separate **etcd** quorum for metadata, **MinIO/S3** for segment object storage, and a **Pulsar** (or RocksMQ) write-ahead log/message bus, plus query/data/index/proxy coordinator pods — is a 4-system operational surface (etcd + MinIO + Pulsar + the Milvus coordinators) we would have to run, back up, and reason about for tenant isolation. None of that distributed machinery earns its keep below ~50–100M vectors. Qdrant is a **single Rust binary** (one StatefulSet, local mmap'd HNSW segments, no external etcd/MinIO/Pulsar) that holds the same ≤ 25 ms p95 at escape-hatch scale, so the escape hatch adds **one** store to operate, not four. |
 
 Postgres is the **only true stateful store** in the ContextOS data plane that we
 operate; Redis is durable-but-cache-shaped (AOF). The `VectorStore`,
@@ -513,6 +662,7 @@ memory:
   replicas: 3
   candidateCap: 512                # scope-boundary invariant: never builds/owns an index
   bm25FailOpen: true               # embedding down -> BM25-only, recall loss <= 12%
+  resources: { requests: { cpu: "300m", memory: "384Mi" }, limits: { cpu: "1", memory: "768Mi" } }
   scaling: { signal: qps, threshold: 700, min: 3, max: 30 }
 
 cache:
@@ -521,6 +671,7 @@ cache:
   exactTier: redis                 # <1ms p99
   semanticTier: pgvector           # 8-15ms p95
   fingerprint: coarse              # C6
+  resources: { requests: { cpu: "250m", memory: "256Mi" }, limits: { cpu: "1", memory: "512Mi" } }
   scaling: { signal: qps, threshold: 1000, min: 3, max: 20 }
 
 router:
@@ -528,6 +679,7 @@ router:
   replicas: 3
   hardFiltersFailClosed: true      # C9
   rbacRouteAction: route           # C10: single authority for allowlist + residency
+  resources: { requests: { cpu: "250m", memory: "256Mi" }, limits: { cpu: "1", memory: "512Mi" } }
   scaling: { signal: qps, threshold: 1500, min: 3, max: 20 }
 
 worker:
@@ -535,6 +687,7 @@ worker:
   replicas: 2
   streams: ["contextos:writeback", "contextos:consolidate", "contextos:gc", "contextos:replay-seal"]
   costLedgerOutbox: fail-closed    # C12 billing-grade durable outbox
+  resources: { requests: { cpu: "500m", memory: "512Mi" }, limits: { cpu: "2", memory: "1Gi" } }
   scaling: { signal: streamDepth, stream: "contextos:writeback", pendingThreshold: 500, min: 2, max: 30 }
 
 embedding:
@@ -542,6 +695,7 @@ embedding:
   replicas: 2                      # warm floor, never scale to zero
   model: "BAAI/bge-small-en-v1.5"
   readinessWarmupEncode: true      # gate readiness on a sentinel encode (<=15s cold start)
+  resources: { requests: { cpu: "1", memory: "1Gi" }, limits: { cpu: "2", memory: "2Gi" } }
   scaling:
     live:  { signal: qps, threshold: 600 }
     batch: { signal: streamDepth, stream: "contextos:embed-batch", pendingThreshold: 2000 }
@@ -560,6 +714,26 @@ reflects that assembly (score+MMR+knapsack over ≤512 candidates) is the
 **CPU-heaviest** in-process step and the one the Rust kernel gate (C14) targets.
 Memory and cache requests are smaller because their hot-path cost is dominated by
 I/O to Postgres/Redis (18 ms ANN probe, < 1 ms exact cache) rather than local CPU.
+
+The full per-pod request/limit matrix (the values in the `values.yaml` blocks
+above):
+
+| Deployment | CPU request | CPU limit | Mem request | Mem limit | Sizing rationale |
+|---|---|---|---|---|---|
+| **gateway** | 700m | 2 | 512Mi | 1Gi | ~0.7 vCPU/1k req/s proxy+assembly; 2 vCPU burst headroom (KEDA `threshold: 800` keeps each replica under its request budget). |
+| **memory** | 300m | 1 | 384Mi | 768Mi | Hot-path but **I/O-bound** — CPU only fuses RRF + rescores ≤512 candidates while it awaits the 18 ms p95 ANN probe and BM25; CPU idles on the await, so request stays low and limit absorbs RRF spikes. |
+| **cache** | 250m | 1 | 256Mi | 512Mi | Exact tier is < 1 ms p99 Redis I/O (near-zero CPU); the 8–15 ms p95 semantic tier's only local CPU is fingerprinting (C6) — the ~6 ms embed itself runs on the **embedding** Deployment, not here. |
+| **router** | 250m | 1 | 256Mi | 512Mi | A ~5 ms p95 in-memory scoring + RBAC `route` decision over a static policy table; trivial CPU, small heap for the policy/breaker state. |
+| **worker** | 500m | 2 | 512Mi | 1Gi | **Off hot path** but batch-CPU-heavy: consolidation, GC sweeps, and replay-bundle sealing (content-address hash + per-tenant encrypt) burst CPU; 2 vCPU limit lets a backlog drain fast, request stays modest since it idles between batches. |
+| **embedding** | 1 | 2 | 1Gi | 2Gi | Only CPU-bound model component: BGE-small ONNX inference on the ~6 ms p95 live lane needs a full vCPU per replica to hold that latency; 1Gi request covers the ~130 MB weights + ONNX runtime arena, 2Gi limit covers batch-lane micro-batches. |
+
+The two Deployments sized for **CPU-bound** work (gateway, embedding) carry the
+largest requests; the three **I/O-bound** hot-path Deployments (memory, cache,
+router) request ≤ 300m because their wall-clock is spent awaiting Postgres/Redis,
+not burning local cycles. Limits are set 2–4× above requests so a burst can use
+idle node capacity without letting one pod starve a co-scheduled neighbor — and
+every limit stays inside the `< 250 ms p95` total-control-overhead budget at the
+KEDA scale threshold.
 
 ---
 

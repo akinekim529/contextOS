@@ -110,24 +110,107 @@ This box does disproportionate work in comment sections: it preempts the "isn't 
 
 Comparison tables are the highest-converting section for infra repos because the visitor is already mentally holding "I use X — why switch?". We name competitors honestly and only claim what the demo proves. We do **not** claim to replace any of them wholesale; we claim a different layer with one feature none of them have.
 
-| Capability | **ContextOS** | mem0 | GPTCache | LiteLLM | Langfuse |
-| --- | --- | --- | --- | --- | --- |
-| **Primary role** | Context middleware (memory + assembly + cache + routing + replay) | Memory layer | Semantic cache | LLM gateway/router | LLM observability/tracing |
-| **Byte-exact context-decision replay** | **Yes — content-addressed, per-tenant-encrypted bundle; single `ReplayResult` schema** | No | No | No | No (records traces, not deterministic replay) |
-| **Context assembly under token budget** | **Yes — score+MMR+knapsack over ≤512 candidates, < 50 ms p95** | Partial (retrieval only) | No | No | No |
-| **Multi-tenant isolation** | **Postgres FORCE RLS + RBAC firewall; 0 leakage, 10k-probe CI gate** | App-level | Namespace-level | Per-key | Project-level |
-| **Semantic + exact two-tier cache** | **Yes — Redis exact (<1 ms p99) + pgvector/Qdrant ANN (8–15 ms p95)** | No | Yes (semantic only) | Basic | No |
-| **Model routing (difficulty/utility/breaker)** | **Yes — fail-closed hard policy (C9), RBAC `route` action (C10)** | No | No | **Yes (broad provider matrix)** | No |
-| **OpenAI-compatible `/v1` drop-in** | **Yes** | No | Partial | **Yes** | N/A |
-| **Self-hosted embeddings** | **Yes — BGE, pluggable provider** | Optional | Optional | N/A | N/A |
-| **RTBF / crypto-shred incl. embeddings** | **Yes — tombstone + idempotent GC, per-subject DEK (C11)** | No | No | No | Data deletion only |
-| **License** | **Apache-2.0** | Apache-2.0 | MIT | MIT | MIT |
+| Capability | **ContextOS** | mem0 | Letta | Zep | GPTCache | LiteLLM | OpenRouter | Langfuse | LangSmith | Helicone |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| **Primary role** | Context middleware (memory + assembly + cache + routing + replay) | Memory layer | Stateful agent server (memory + agent runtime) | Memory + temporal knowledge graph | Semantic cache | LLM gateway/router | Hosted multi-provider routing marketplace | LLM observability/tracing | LLM app eval + tracing (LangChain) | LLM observability/cost proxy |
+| **Byte-exact context-decision replay** | **Yes — content-addressed, per-tenant-encrypted bundle; single `ReplayResult` schema** | No | No | No | No | No | No | No (records traces, not deterministic replay) | No (logs runs + evals, not deterministic re-derivation) | No (request logs, not replay) |
+| **Context assembly under token budget** | **Yes — score+MMR+knapsack over ≤512 candidates, < 50 ms p95** | Partial (retrieval only) | Partial (agent-managed window, no budget-knapsack) | Partial (graph retrieval only) | No | No | No | No | No | No |
+| **Multi-tenant isolation** | **Postgres FORCE RLS + RBAC firewall; 0 leakage, 10k-probe CI gate** | App-level | App/project-level | Per-user/session | Namespace-level | Per-key | Per-account | Project-level | Workspace/project-level | Per-key |
+| **Semantic + exact two-tier cache** | **Yes — Redis exact (<1 ms p99) + pgvector/Qdrant ANN (8–15 ms p95)** | No | No | No | Yes (semantic only) | Basic | Passthrough only | No | No | Yes (exact bucket cache) |
+| **Model routing (difficulty/utility/breaker)** | **Yes — fail-closed hard policy (C9), RBAC `route` action (C10)** | No | No | No | No | **Yes (broad provider matrix)** | **Yes (price/latency routing)** | No | No | Basic (load-balance/fallback) |
+| **OpenAI-compatible `/v1` drop-in** | **Yes** | No | Partial | No | Partial | **Yes** | **Yes** | N/A (SDK wrap) | N/A (SDK wrap) | **Yes (base_url proxy)** |
+| **Self-hosted embeddings** | **Yes — BGE, pluggable provider** | Optional | Optional | Optional | Optional | N/A | N/A | N/A | N/A | N/A |
+| **RTBF / crypto-shred incl. embeddings** | **Yes — tombstone + idempotent GC, per-subject DEK (C11)** | No | No | No | No | No | No | Data deletion only | Data deletion only | Data deletion only |
+| **License** | **Apache-2.0** | Apache-2.0 | Apache-2.0 | Apache-2.0 | MIT | MIT | Closed (hosted) | MIT | Closed (hosted) | Apache-2.0 |
+
+> The five right-most columns (Letta, Zep, LangSmith, Helicone, OpenRouter) extend the four head-to-head incumbents to a 9-competitor field; the **same five functional slices** (memory, cache, routing, observability, orchestration) and the full reasoning for why each owns its slice but is structurally blind to the joint context-window problem are laid out in the competitive-landscape table of [`00-executive-summary.md`](00-executive-summary.md). The takeaway is uniform across all nine: **none reconstructs a context decision byte-for-byte**, which is the only column ContextOS leads on without qualification.
 
 **Honest "use them together" footer** (critical — attacking incumbents loses; composing with them wins):
 
 > ContextOS sits in front of your model. It **complements** LiteLLM (use LiteLLM as a downstream adapter target), exports OpenTelemetry spans you can ship to Langfuse, and can ingest a mem0 store behind the `MemoryProvider` interface. We replace none of them; we add the layer that records and replays *why your context looked the way it did*.
 
 This footer is strategic: it converts potential detractors (maintainers/users of those projects) into amplifiers, because we're not threatening their adoption.
+
+### 3.1 Inference-runtime composition: ContextOS never competes with vLLM / TGI / Ollama
+
+The most common objection on r/LocalLLaMA and the vLLM Discord is "isn't this just another serving layer?". It is not, and the boundary is mechanical: **ContextOS runs no model weights and schedules no GPUs.** It owns the context window *upstream* of inference and hands a finished prompt to whatever runtime actually executes tokens. The three runtimes people will pair it with:
+
+| Runtime | What it is | Why ContextOS never competes with it | How it composes |
+| --- | --- | --- | --- |
+| **vLLM** | High-throughput GPU inference server (PagedAttention KV-cache, continuous batching); exposes an OpenAI-compatible `/v1`. | ContextOS does no KV-cache paging, no batching, no GPU scheduling — it has zero tokens-per-second to optimize because it never decodes. | Point the backend adapter at the vLLM endpoint: `backend.base_url = "http://vllm:8000/v1"`. ContextOS assembles the prompt, vLLM decodes it, the `BackendInvocation` boundary (C7) records the call. |
+| **TGI** (Text Generation Inference) | HuggingFace's Rust/Python GPU serving stack (tensor parallelism, token streaming) with an OpenAI-compatible route. | Same boundary — TGI owns the decode loop and GPU memory; ContextOS owns retrieval/ACL/compression/assembly/routing *before* the request reaches TGI. | Identical adapter target: `backend.base_url = "http://tgi:8080/v1"`; streaming tokens flow back through the gateway unchanged. |
+| **Ollama** | Local single-box runtime (GGUF/llama.cpp) for laptops/edge; OpenAI-compatible `/v1` on `:11434`. | ContextOS does no quantization, no model pull, no llama.cpp execution; it is the control plane, Ollama is the engine. | `backend.base_url = "http://localhost:11434/v1"` — this is exactly the "no API key, fully local" path the quickstart's stub backend stands in for; swapping the stub for Ollama is a one-line config change. |
+
+Because all three already speak OpenAI-compatible `/v1`, the adapter is the **same `OpenAICompatBackend`** in every case — only the `base_url` changes. This is the structural reason ContextOS composes rather than competes: it is a client of the runtime, never a replacement for it.
+
+---
+
+## Migration / Adoption Path (<30 min)
+
+The single biggest adoption blocker for middleware is "I have to rewrite my app." ContextOS sits behind the **OpenAI-compatible `/v1`** surface specifically so the migration is a *configuration* change, not a *code* change. The drop-in compatibility is load-bearing — it is why the migration fits in under 30 minutes — and every step below preserves it.
+
+### Case 1 — raw OpenAI-API app: change `base_url` only
+
+If you already call the OpenAI SDK, the migration is a one-line diff. Nothing else changes — same `messages`, same streaming, same response shape — because the ContextOS gateway speaks OpenAI-compatible `/v1`:
+
+```diff
+  from openai import OpenAI
+
+- client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
++ client = OpenAI(
++     base_url="http://localhost:8080/v1",   # the ContextOS gateway
++     api_key="demo-tenant-key",             # your ContextOS tenant key
++ )
+
+  resp = client.chat.completions.create(
+      model="contextos-auto",                # router picks the backend; "gpt-4o" etc. still works
+      messages=[{"role": "user", "content": "What did we decide about the Q3 launch?"}],
+  )
++ print(resp.model_extra["x_contextos_replay_id"])   # NEW: byte-exact replay handle, ULID
+```
+
+The only *added* surface is `x_contextos_replay_id` on the response — a pure addition that an existing app simply ignores until it wants replay.
+
+### Case 2 — LangChain app: point `ChatOpenAI` at the gateway
+
+LangChain's `ChatOpenAI` is itself an OpenAI-compatible client, so the same one-line change applies — no adapter, no chain rewrite:
+
+```diff
+  from langchain_openai import ChatOpenAI
+
+- llm = ChatOpenAI(model="gpt-4o", api_key=OPENAI_API_KEY)
++ llm = ChatOpenAI(
++     model="contextos-auto",
++     base_url="http://localhost:8080/v1",   # ContextOS gateway
++     api_key="demo-tenant-key",
++ )
+  # every chain / agent built on `llm` now routes through ContextOS unchanged
+```
+
+If you instead want explicit access to the ContextOS extras (replay id, budget ledger, residency hints) inside a chain, wrap once with the thin adapter rather than touching call sites:
+
+```python
+# before: vanilla LangChain LLM
+llm = ChatOpenAI(model="gpt-4o", api_key=OPENAI_API_KEY)
+
+# after: same object, plus ContextOS metadata threaded into each Generation
+from contextos.langchain import ContextOSChat
+llm = ContextOSChat(base_url="http://localhost:8080/v1", api_key="demo-tenant-key")
+# llm.invoke(...).response_metadata["x_contextos_replay_id"]  -> ULID
+```
+
+### Timed onboarding checklist (justifies the <30-minute bound)
+
+| Step | Action | Budget | Why it fits |
+| --- | --- | --- | --- |
+| 1. Install | `git clone … && docker compose up -d` (Postgres+pgvector, Redis, embedder, gateway, stub backend) | ~8 min | Dominated by image pulls on a cold cache; warm cache is ~90 s. No GPU, no cloud account, no key (matches the §2.2 quickstart). |
+| 2. Seed | `uv run contextos seed --tenant demo` | ~1 min | Creates the tenant + sample corpus; one command. |
+| 3. Point client | apply the one-line `base_url` diff above (Case 1 or 2) | ~5 min | A single edit in one file; no call-site or chain rewrite. |
+| 4. First request | re-run your existing app; confirm a normal completion + a surfaced `x_contextos_replay_id` | ~5 min | Same request/response shape, so existing assertions still pass. |
+| 5. First replay | `uv run contextos replay <replay_id> --open` | ~5 min | The wedge moment — you see *why* the prompt was built that way. |
+| **Total** | | **~24 min** | Comfortably inside the **<30-minute** bound with slack for a cold image cache. |
+
+**Rejected alternative — ship a custom ContextOS SDK and require a migration to it.** A bespoke SDK (`contextos.Client(...)` with its own method names) would **break drop-in compatibility**: every call site, every LangChain integration, and every third-party tool that already speaks OpenAI's `/v1` would need rewriting, the migration would jump from one line to a multi-day refactor, and we would forfeit the entire ecosystem of OpenAI-compatible clients (LangChain, LlamaIndex, the official SDKs in every language). The whole adoption thesis is "change `base_url`, change nothing else"; a custom SDK is the one decision that would invalidate it, so it is rejected.
 
 ---
 
@@ -205,6 +288,7 @@ Green CI is a trust signal; *what* the CI enforces is the differentiator. We pub
 | **Lint** | `ruff check` + `ruff format --check` | Any lint/format violation | One formatter, fast. (Rejected: black+flake8+isort — three tools, slower, redundant.) |
 | **Types** | `mypy --strict` | Any type error | Middleware in a hot path cannot ship `Any`-typed boundaries. Strict, not gradual. |
 | **Tests** | `pytest` (+ `pytest-asyncio`) | Any failure; coverage < 85% on core packages | Baseline correctness. |
+| **Integration tests** | `docker compose` end-to-end + `pytest` | The compose stack fails to come up, OR a `POST /v1/chat/completions` does not write a `ContextBundle` + `ReplayResult`, OR a recorded-output replay of that `replay_id` is **not bit-exact** (`output_equal == False` or `bundle_digest` mismatch) | Unit tests with mocked dependencies pass even when RLS is misconfigured or the pipeline runs out of order — only a real Postgres+pgvector+Redis+embedder+stub-backend round-trip catches those. (Rejected: mock every dependency — misses RLS/pipeline-ordering regressions; a mock never enforces `SET LOCAL app.tenant_id` or "compress after redact", so the two highest-blast-radius regression classes ship silently green.) |
 | **🔒 Tenant-isolation gate** | custom property test (Hypothesis) | **<10,000 hostile second-tenant probes pass, OR any probe reads another tenant's row/vector/cache key** | This is the canonical **0 cross-tenant leakage** guarantee. It encodes the security claim as an executable contract. Non-negotiable, blocking. |
 | **Mutation testing on fail-closed paths** | `mutmut` (or `cosmic-ray`) | Surviving mutant in any `@fail_closed`-tagged module (RLS set, RBAC `check`, router hard-policy filter, namespace HARD filter) | A passing test that survives mutation is theater. Fail-closed code (C2/C9/C10) **must** kill 100% of mutants in those modules — otherwise the security tests aren't actually testing the security. |
 | **Replay schema compat** | `buf breaking` | Breaking change to `replay/v1` without a version bump | Protects the byte-exact promise across releases (§5). |
@@ -212,6 +296,61 @@ Green CI is a trust signal; *what* the CI enforces is the differentiator. We pub
 | **Rust wheels** *(conditional, lands with ADR-0001)* | `maturin build` + `cibuildwheel` | Wheel build/test fails on linux/mac, x86_64/arm64 | When the kernel gate (C14) trips and Rust lands, wheels must be reproducible across platforms or the install path breaks. Until then, this job is a no-op skip. |
 
 **Mutation testing scoped narrowly on purpose.** Running mutation testing on the whole codebase is too slow for PR CI and would be disabled within a week. We scope it to the handful of fail-closed security modules where a surviving mutant is an actual breach risk. This is defensible, fast, and the strongest possible answer to "how do you know RLS is really enforced?" — *because a mutated `SET LOCAL app.tenant_id` makes 10,000 probes fail and a mutated RBAC `check` makes the mutation suite fail.*
+
+### 6.1 Human pentest of the tenant-isolation surface (before M3)
+
+The ≥10,000-probe gate is necessary but **not sufficient**: Hypothesis generates *randomized* second-tenant probes against the data plane, so it reliably catches a dropped `WHERE`/missing `SET LOCAL` (a *property* violation), but it does not reason about *logic and auth-flow* exploits — a probe sequence that escalates RBAC by replaying a stale token, a cache key collision that requires crafting two semantically distinct prompts that hash equal, or an error message that behaves as an oracle. Those are adversarial, multi-step, and intent-driven; random sampling almost never stumbles onto them.
+
+So before the **M3** milestone we commission a **scoped third-party (or dedicated internal) red-team engagement** of the tenant-isolation surface, with a written scope that names the four attack classes the automated gate cannot:
+
+| Attack class | Concrete probe the human runs | What the 10k-probe gate misses here |
+| --- | --- | --- |
+| **RLS bypass** | Craft a request that reaches a code path where the session GUC is unset or reset (connection-pool reuse, a `SET LOCAL` that didn't fire inside the transaction) and read a foreign row. | Property tests assume the GUC is set per request; they don't fuzz the *pool lifecycle* where it can leak. |
+| **Namespace escape** | Coerce the retrieval HARD filter (C2) into resolving a sibling tenant's namespace via path traversal / Unicode-normalization in the namespace string. | Random namespaces are well-formed; an attacker supplies a *malformed* one designed to defeat the filter. |
+| **Cache-key / error-oracle leakage** | Send two prompts engineered to collide on the COARSE fingerprint (C6) across tenants; separately, time-or-content-diff error responses to infer whether a foreign key exists. | The gate checks *reads*, not *side-channels*; a timing or 404-vs-403 oracle leaks existence without ever reading a row. |
+| **Cross-tenant cache poisoning** | Write to a semantic-cache entry under tenant A and attempt to make tenant B's lookup resolve to it. | Probes read; they don't model a *write-then-foreign-read* sequence. |
+
+**Relationship to the automated gate (stated explicitly, because reviewers will ask):** the 10k-probe gate is the *continuous, every-push regression net* that guarantees a previously-closed hole stays closed; the pentest is the *one-time, human-creativity sweep* that finds the holes the property gate was never shaped to look for. Findings from the pentest are **converted into new deterministic probes and added to the gate**, so each human-found exploit becomes a permanent automated check — the engagement ratchets the gate's coverage upward rather than replacing it. The result is published as a redacted summary in `SECURITY.md`, dated, with the engagement scope. **Rejected alternative: rely on the property gate alone.** Randomized probes provide *breadth* (millions of well-formed accesses) but zero *adversarial depth*; an isolation claim defended only by random sampling is exactly the claim a motivated attacker disproves on day one, and "0 cross-tenant leakage" is too load-bearing a promise to leave to sampling luck.
+
+### 6.2 The end-to-end integration job, step by step
+
+The **Integration tests** row above asserts a full round-trip; here is the exact op-sequence the job runs in CI, because "we have integration tests" is an assertion and a sequence is proof:
+
+```yaml
+# .github/workflows/ci.yml (integration job, abridged to the load-bearing steps)
+integration:
+  services: {}            # not used — we bring the stack up via compose for parity with `docker compose up`
+  steps:
+    - run: docker compose -f docker-compose.ci.yml up -d   # postgres16+pgvector, redis, embedder(bge-small-en-v1.5), gateway, stub-backend
+    - run: uv run contextos migrate && uv run contextos seed --tenant demo
+    - run: uv run pytest tests/integration -q                # the assertions below live here
+```
+
+```python
+# tests/integration/test_end_to_end_replay.py
+async def test_chat_writes_bundle_and_replays_bit_exact(gateway, db, redis):
+    # 1. real request through the real pipeline (no mocks)
+    resp = await gateway.post("/v1/chat/completions", json={
+        "model": "contextos-auto",
+        "messages": [{"role": "user", "content": "What did we decide about the Q3 launch?"}],
+    }, headers={"Authorization": "Bearer demo-tenant-key"})
+    replay_id = resp.json()["x_contextos_replay_id"]                       # ULID, surfaced per §2.2
+
+    # 2. assert the side effects were actually persisted (this is what a mock cannot prove)
+    bundle = await db.fetchrow(
+        "SELECT bundle_digest FROM context_bundles WHERE replay_id = $1", replay_id)
+    assert bundle is not None                                              # ContextBundle written
+    rr = await db.fetchrow(
+        "SELECT schema_version FROM replay_results WHERE replay_id = $1", replay_id)
+    assert rr["schema_version"] == "contextos.replay.v1"                   # ReplayResult written
+
+    # 3. recorded-output replay must be bit-exact
+    result = await gateway.replay(replay_id, live_backend=False)
+    assert result.output_equal is True                                    # byte-for-byte
+    assert result.bundle_digest == bundle["bundle_digest"]                # content address stable
+```
+
+The job fails if the compose stack does not become healthy, if either row is absent, or if `output_equal` is `False`. Crucially, the pipeline-ordering invariant ("compress ALWAYS after ACL/redact") is observable here: the recorded `DeterministicStage` list in the persisted `ReplayResult` is asserted to be in canonical order, so a reordering regression that a mocked unit test would never surface turns this job red.
 
 ---
 

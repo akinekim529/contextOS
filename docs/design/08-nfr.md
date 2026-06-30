@@ -65,6 +65,27 @@ Write-back enqueue (OFF critical path) ............................... ├2ms┤
 
 **Critical-path p95** = edge(5) + cache-miss-embed(6) + retrieval(40) + assembly(50) + routing(5) + adapter(8) = **114 ms**, with the embedding cost shared (not paid twice) and write-back enqueue off-path. The remaining **136 ms** of the 250 ms budget is deliberate **tail headroom**: GC pauses, connection-pool checkout under load, a cold HNSW segment, RLS planner re-evaluation, and the C3 *re-validation after routing* (re-pack against the routed model's true tokenizer, or fail-closed 413). We budget overhead at `< 250 ms` rather than `< 150 ms` precisely so that p99/p99.9 events stay inside the SLO rather than blowing it.
 
+**The 136 ms is itself budgeted, not a slush fund.** "Tail headroom" with no line items is indistinguishable from padding; we name the worst-case tail contributors and cap each, so an on-call engineer can attribute a p99 breach to a *specific* row rather than shrugging at "the tail."
+
+| Tail contributor | Worst-case cap | What it is / why it bounds here |
+|---|---|---|
+| **GC pause** | **≤ 30 ms** | A CPython gen-2 collection or a `uvloop` allocator stall on the hot path. Bounded by generational-GC tuning + pre-sized assembler buffers (the same buffers the §5 Rust gate would replace); a single pause stays under 30 ms or the GC config is the regression. |
+| **Connection-pool checkout** | **≤ 40 ms** | Waiting for a free Postgres connection from the pgvector pool under burst (pool saturation, not query time). Bounded by pool-size headroom + a checkout timeout; exceeding it means the pool is undersized for the offered load, a capacity alarm, not an SLO surprise. |
+| **Cold HNSW segment** | **≤ 50 ms** | First touch of an HNSW page not yet in shared_buffers/OS cache — the cold-page tail the §8.1.2 "60 ms retrieval headroom" already anticipates. Bounded by index warmup + working-set RAM sizing; the steady-state ANN p95 stays 18 ms, this is the cold outlier only. |
+| **RLS planner re-plan** | **≤ 16 ms** | A `SET LOCAL app.tenant_id` change forcing the planner to re-evaluate the `tenant_isolation` policy predicate on a cold plan cache. Bounded by `plan_cache_mode` + prepared statements so the policy predicate is planned once per connection, not per request. |
+
+These four sum to **136 ms** — they consume the headroom **exactly**, by construction, so the budget is fully allocated rather than vaguely "spare." They are *worst-case caps that do not co-occur at p95* (a request paying the cold-HNSW 50 ms is, by definition, not also hitting a warm-pool fast path), which is why the critical-path p95 stays at 114 ms while the p99/p99.9 tail still fits inside 250 ms when one or two of these fire on the same request.
+
+**Cache-MISS vs cache-HIT end-to-end (the two paths, as single figures).** The cache decision forks the request into exactly two latency classes, and we publish each as one number so callers can reason about both:
+
+| Path | End-to-end control-plane p95 | What runs |
+|---|---|---|
+| **Cache MISS** (the full control path) | **≈ 114 ms** (SLO `< 250 ms` with tail headroom) | edge(5) + embed(6) + retrieval(40) + assembly(50) + routing(5) + adapter(8) — the entire pipeline below the cache executes; this is the **steady-state miss figure** and it equals the §8.1.3 critical-path p95. |
+| **Cache HIT — exact tier** | **< 1 ms p99** + edge(5) ⇒ **≈ 6 ms** to first byte | edge auth/tenant + Redis `GET`; retrieval, assembly, routing, **and the backend `invoke` are all skipped** — the response is served from the cache entry. |
+| **Cache HIT — semantic tier** | **8–15 ms p95** + edge(5) ⇒ **≈ 13–20 ms** | edge + embed(6) + semantic ANN(4–9); still short-circuits retrieval/assembly/routing/backend. |
+
+The **whole economic point of the cache** is that a hit collapses a ~114 ms (plus model-inference) request into single-digit-to-low-double-digit milliseconds **and** avoids the backend token cost entirely — which is the 15–30% caching slice of the §8.6 savings. The miss path is the *full* `< 250 ms` overhead budget because, on a miss, ContextOS does all of its work; the hit path is the short-circuit. Stating both as single figures prevents the common middleware lie of quoting the hit latency as if it were the typical latency: at a 25–45% hit-ratio (§8.6), the **majority of requests pay the ~114 ms miss path**, so 114 ms — not 6 ms — is the number capacity planning must use.
+
 **Rejected alternative — publishing the 120 ms sum as the SLO.** Tempting (it looks tighter, more impressive), rejected because it leaves *zero* tail headroom; the first GC pause or cold cache page would push p99 over the published bound and the SLO would be a lie under real load. A budget you cannot hold at p99 is marketing, not engineering. We publish the number we can defend at the tail.
 
 **Rejected alternative — a single fused `< 250 ms` SLO with no sub-budgets.** Rejected because when overhead regresses you must know *which stage*. The nested SLOs (`50 ms` assembly ⊂ `100 ms` retrieval-class ⊂ `250 ms` overhead) give three independent regression alarms, each mapping to a different on-call runbook.
@@ -159,10 +180,25 @@ Until the gate fires, the Python assembler is the shipping implementation and th
 
 | Axis | Scaling mechanism | Bound |
 |---|---|---|
-| **Gateway throughput** | Add stateless replicas (no shared state). | Linear to LB capacity. |
-| **N tenants** | `tenant_id` is a non-null partition key on *every* row/object/key (C2). Postgres native partitioning by `tenant_id`; Redis + cache namespaced per tenant. | Partition count, not data volume, is the ceiling. |
+| **Gateway throughput** | Add stateless replicas (no shared state). | Linear to LB capacity (stated ceiling below). |
+| **N tenants** | `tenant_id` is a non-null partition key on *every* row/object/key (C2). Postgres native partitioning by `tenant_id`; Redis + cache namespaced per tenant. | Partition count, not data volume, is the ceiling (stated below). |
 | **M sessions/tenant** | Working/short-term memory in Redis with TTL; long-term/episodic/semantic in Postgres + pgvector. Session state is ephemeral and evicts. | Redis memory (bounded by TTL). |
 | **Vector volume** | pgvector HNSW co-located in Postgres up to **5M vectors/tenant** (ANN p95 18 ms); **Qdrant escape hatch** beyond, holding ≤ 25 ms. | Per-tenant 5M-vector cutover line. |
+
+#### 8.4.1 "Linear to N" has a stated ceiling — two of them
+
+"Linear scaling" is true only up to a real wall, and an NFR that says "linear to N" without naming the N where linearity ends is hiding the wall. ContextOS has **two** such ceilings, each with a number and a documented mitigation past it.
+
+**Postgres native-partition ceiling: ~1,000–2,000 partitions before planner overhead bites.** `tenant_id`-keyed declarative partitioning is linear in *data volume* but the **partition count** itself is the wall: the Postgres 16 planner does per-partition work (constraint exclusion / partition pruning, locking each partition's metadata) at plan time, and partition-wise plan cost grows super-linearly once the table has **more than roughly 1,000–2,000 leaf partitions** — beyond that, plan latency and `pg_class`/lock contention start eroding the §8.1 edge+retrieval budget even with pruning enabled.
+
+- **Mitigation (built in, not bolted on):** we partition by **`HASH(tenant_id)` into a fixed, bounded partition count** (e.g. 256 or 1,024 hash partitions), **not one partition per tenant** — so 1 tenant and 1,000,000 tenants both map onto the same fixed ≤ 1,024-partition table, and *tenant count* never drives *partition count*. Partition count is a deploy-time constant chosen under the ~1,000–2,000 planner ceiling; data volume scales inside each hash bucket, isolation is enforced by RLS (not by partition boundaries). The §8.5 *time*-partitioned trace/cost tables are bounded the same way (current + a small rolling window of detached partitions, old ones archived), so they never accrete toward the planner wall either.
+- **Rejected alternative — partition-per-tenant (`PARTITION BY LIST (tenant_id)`, one leaf per tenant).** Tempting (perfect physical isolation per tenant) and rejected: it makes *partition count = tenant count*, so at a few thousand tenants the planner ceiling above is hit and every query slows for every tenant — the precise opposite of the multi-tenant scaling goal. Hash partitioning + RLS gives the same isolation guarantee (validated by the ≥ 10k hostile-probe gate) without coupling partition count to tenant count.
+
+**L4/L7 load-balancer throughput ceiling: ~1–2M req/s (L4) and ~100k–300k req/s (L7) per LB before the LB is the bottleneck.** Gateway replicas scale the *compute* linearly, but they all sit behind a load balancer, and the LB has its own envelope:
+
+- **L4 (connection/packet) LB** — e.g. an NLB-class or IPVS/`kube-proxy` L4 balancer — sustains on the order of **1–2 million new connections/s** before SYN-table/conntrack and the flow-hash table saturate. With connection reuse (keep-alive) the *request*/s ceiling is higher still, so a single L4 tier comfortably fronts the full 5k–10k req/s × N-replica fleet into the **hundreds of thousands to low millions of req/s**.
+- **L7 (HTTP-aware) LB** — TLS termination + HTTP parsing + per-request routing — is the tighter wall at **~100,000–300,000 req/s per L7 instance**, because each request costs a TLS handshake amortization + header parse + route match, not just a packet forward.
+- **Mitigation past the ceiling:** ContextOS pins the **TLS + HTTP-parse cost at the L7 edge** and keeps the gateway pool itself **L4-addressable**, so the fleet scales by adding gateway replicas behind a horizontally-shardable L4 tier (multiple LB front-ends under DNS/anycast) rather than funneling everything through one L7 instance. The L7 ceiling is therefore *per L7 front-end*, and front-ends shard — the system-wide ceiling is "add another LB front-end," consistent with the stateless-replica scaling model. **Rejected alternative — a single fat L7 LB doing TLS for the whole fleet:** caps the entire system at one L7 instance's ~100k–300k req/s regardless of how many gateway replicas exist, re-centralizing the bottleneck the stateless design exists to remove.
 
 Tenant isolation scales without a per-tenant database: FORCE ROW LEVEL SECURITY + the app RBAC firewall guarantee **0 cross-tenant leakage**, validated by a CI hard gate of **≥ 10,000 hostile second-tenant property probes**. Within-tenant namespace (project/agent/user) is a **hard, fail-closed filter at the repository boundary** keyed on `tenant_id`; missing/ambiguous namespace = deny (C2).
 
@@ -313,6 +349,90 @@ async def retrieve(query, tenant_id, namespace):
 The dense ANN leg drops; the **BM25 leg keeps serving** with a **bounded recall loss of ≤ 12%**. This is a deliberate availability-over-perfection trade: a 12%-worse-recall answer beats a 503. The bound is enforced by the C6/§8.6 fingerprint and retrieval design — lexical BM25 alone recovers ≥ 88% of the fused-mode recall on the evaluation workload.
 
 **Streaming idempotency (C15):** a streaming request carrying an `Idempotency-Key` that has already reached a server terminal `finish_reason` returns the **materialized final response** with **zero second backend call** — the first run's recorded output is replayed, never re-invoked. This ties directly to the client-abort rule (C8): server `finish_reason` reached ⇒ write-back committed and the response materialized; a client TCP close *before* the server terminal event ⇒ discard, no materialized response, partial cost attributed to the partial-completion ledger entry.
+
+---
+
+## Retrieval-recall correctness eval
+
+The §8.1 SLOs and §8.8 degraded bound say how *fast* retrieval is and how it *fails over*; neither says whether the fused result is *correct* — i.e., whether the candidates handed to the assembler actually contain the documents a human judged relevant. Latency without a recall floor is a fast wrong answer. This subsection makes retrieval **end-task correctness** a measured, gated quantity, exactly as §8.6 / §2.4 make cache correctness a measured quantity.
+
+### Targets (fused ANN ‖ BM25 + RRF mode)
+
+The eval scores the **production fusion path** — pgvector HNSW ANN (`cosine`) ‖ BM25 lexical, fused with **Reciprocal Rank Fusion at k = 60** (`RRF_K = 60`, the built value in `memory/scoring.py`), MMR-deduped at `λ = 0.70` / `cos-dup = 0.95`, hard-capped at **≤ 512** — against graded relevance judgments.
+
+| Metric | Target (fused mode) | Floor that fails the build | Why this number |
+|---|---|---|---|
+| **recall@10** | **≥ 0.85** | < 0.80 | The assembler can only pack what retrieval surfaced; below 0.85 the lost-in-the-middle edge-placement work is rearranging an already-incomplete set. |
+| **recall@50** | **≥ 0.94** | < 0.90 | The ≤ 512 cap is far above 50, so by k=50 the fused path should have caught nearly all judged-relevant docs; a low recall@50 means the *fusion*, not the cap, is dropping them. |
+| **nDCG@10** | **≥ 0.78** | < 0.72 | Graded (not binary) — rewards putting the *most* relevant doc first, which is what RRF + rescore exist to do. |
+| **BM25-only recall@10** (degraded mode, §8.8.1) | **≥ 0.75** | < 0.748 | Encodes the canonical **≤ 12% recall loss** bound: `0.85 × (1 − 0.12) = 0.748`. The degraded lexical leg must stay within 12% of fused recall@10, or the "fail-open to BM25" promise is a lie. |
+
+These are **p50-over-queries** targets on the golden set (median query), with the build-failing floor checked on the **mean** so a few catastrophic queries cannot be masked by good ones.
+
+### The golden eval set: `contextos-retrieval-golden-v1`
+
+A **named, versioned, checked-in** judgment set — the retrieval analogue of the cache-correctness harness's labeled pairs (§2.4, `docs/design/02-module-deep-dive/2.4-semantic-cache.md`):
+
+```
+contextos-retrieval-golden-v1/
+  corpus.jsonl        # {doc_id, tenant_id, namespace, content}  — multi-tenant by construction
+  queries.jsonl       # {query_id, tenant_id, namespace, text}
+  qrels.tsv           # query_id \t doc_id \t graded_relevance(0..3)   (TREC qrels format)
+  VERSION             # contextos-retrieval-golden-v1 ; sha256 of (corpus+queries+qrels)
+```
+
+- **Composition (1,000 queries / ~50k docs):** 60% drawn from de-identified production retrieval traces (the real query/candidate distribution that also feeds the §5 assembler gate), 40% adversarial hand-authored — paraphrase-heavy (stresses the dense leg), keyword-exact / rare-term (stresses BM25), and **multi-tenant decoys** (the *correct* doc for query Q lives in tenant A; a lexically-near distractor lives in tenant B — a doc retrieved from B is both a recall miss **and** a leakage failure, so this set double-serves the §8.4 invariant).
+- **Judgments:** graded 0–3 (TREC convention: 3 = perfect, 0 = irrelevant), so nDCG is computable, not just binary recall.
+- **Versioning:** the `VERSION` sha pins corpus+queries+qrels together; a recall regression is always attributable to a *code* change, never a silent eval-set drift. Bumping the set is a reviewed PR that re-baselines the targets above.
+
+### The harness (mirrors the cache-correctness harness pattern)
+
+Same shape as the offline cache-correctness eval (§2.4 / §8.6.1): an **offline, scheduled, CI-gated** job that replays a labeled set through the *real* production code path and emits a pass/fail against published numbers. It does **not** mock retrieval — it calls the same `MemoryEngine.retrieve` fusion path the gateway calls.
+
+```python
+# tools/eval/retrieval_recall.py  — offline; scheduled weekly + on-demand after
+# embed-model / RRF-k / MMR-param changes. Owner: Memory/Retrieval subsystem lead.
+def eval_retrieval(golden: GoldenSet, engine: MemoryEngine) -> RecallReport:
+    per_query = []
+    for q in golden.queries:                      # tenant+namespace from the judgment row
+        ctx  = SecurityContext(tenant_id=q.tenant_id, namespace=q.namespace, ...)
+        cands = await engine.retrieve(ctx, q.text, k=512)   # SAME fused path as prod
+        ranked = [c.memory_id for c in cands]               # post-RRF, post-MMR order
+        rel    = golden.qrels[q.query_id]                   # {doc_id: grade 0..3}
+        per_query.append(QueryScore(
+            recall_at_10 = recall_at_k(ranked, rel, k=10),
+            recall_at_50 = recall_at_k(ranked, rel, k=50),
+            ndcg_at_10   = ndcg_at_k(ranked, rel, k=10),    # graded gain, log2 discount
+            leaked       = any(doc_tenant(d) != q.tenant_id for d in ranked),  # MUST be False
+        ))
+    rep = aggregate(per_query)                    # p50 + mean per metric
+    assert not rep.any_leaked,        "cross-tenant doc in fused result"   # 0-leakage gate
+    assert rep.mean_recall_at_10 >= 0.80, f"recall@10 {rep.mean_recall_at_10} < floor"
+    assert rep.mean_ndcg_at_10   >= 0.72, f"nDCG@10 {rep.mean_ndcg_at_10} < floor"
+    return rep
+```
+
+`recall_at_k` = `|{relevant docs in top-k}| / |{relevant docs}|`; `ndcg_at_k` uses graded gain `2^rel − 1` with a `log2(rank+1)` discount, normalized by the ideal ordering. Both are pure functions of `(ranked_ids, qrels)` — deterministic, replay-stable, and unit-testable in isolation, the same property the cache-correctness `false_hit_rate` computation has.
+
+### Example output
+
+```json
+{
+  "eval_set": "contextos-retrieval-golden-v1",
+  "fused":   { "recall@10": 0.871, "recall@50": 0.946, "nDCG@10": 0.793, "leaked": 0 },
+  "bm25_only": { "recall@10": 0.764 },
+  "degraded_recall_loss": 0.123,
+  "gate": "PASS"
+}
+```
+
+(Here `degraded_recall_loss = 1 − 0.764/0.871 = 0.123` — i.e., 12.3%, inside the ≤ 12% policy bound within rounding; the harness records it so drift past 12% trips an alarm.)
+
+### Milestone
+
+The **hit-ratio** harness ships in **M1** (§9, "Cache-eval / cache-correctness harness"); the **full retrieval correctness eval — recall@k / nDCG on `contextos-retrieval-golden-v1` — ships in M3** alongside the cache-correctness eval, as a CI gate on the §9 "Cache-eval / cache-correctness harness" row extended to retrieval. M1 records baseline recall@k numbers (informational, non-gating) so M3 has a regression reference.
+
+**Rejected alternative — trusting raw pgvector ANN cosine distances as the quality proxy.** Tempting (it is free — the distances are already computed, no judgment set to build or maintain) and **rejected**: ANN distance measures *how close the candidate is to the query embedding in bge-small-en-v1.5 space*, which is **not** the same question as *does the assembler receive the documents a human judged relevant for the end task*. A tight cosine distance to a semantically-similar-but-factually-wrong passage (the exact failure §2.5's NLI guard exists to catch) scores *great* on raw ANN distance and *fails* the end task. Raw distance also says nothing about the **BM25 leg or the RRF fusion** — the two things most likely to regress when `RRF_K`, the MMR params, or the embed model change — because it never crosses the lexical leg at all. Only a labeled recall@k / nDCG eval against judged relevance measures retrieval *correctness*; ANN distance measures retrieval *self-consistency*, which can be perfect while recall is poor.
 
 ---
 

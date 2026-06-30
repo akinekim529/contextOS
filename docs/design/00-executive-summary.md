@@ -1,5 +1,7 @@
 # ContextOS — Executive Summary
 
+> **Framing (per §10.1):** the actual ≤250-word Executive Summary *is* the **Core Thesis** block immediately below. Every section after the first `---` (What ContextOS Is, The Wedge, Rejected Positionings, Flagship, Headline Numbers, Target Users, Why Now) is a **supporting appendix** and is **not** counted against the ≤250-word cap.
+
 ## Core Thesis (≤250 words)
 
 Every LLM application secretly runs an operating system for one scarce, contested resource: the context window. Today that OS is improvised inline — memory lookups here, a cache there, routing logic in a helper module, observability bolted on after the fact — and it is rebuilt, badly, in every application. **ContextOS is open-source middleware that sits between any application and any LLM backend and owns the context window as a single, joint, per-tenant, budget-constrained, zero-trust, replayable decision.**
@@ -35,11 +37,16 @@ The market has fragmented the context window along functional seams. Each incumb
 
 | Slice | Incumbents | What they own | What they cannot do |
 | --- | --- | --- | --- |
-| Memory | mem0, Zep | store/retrieve user & session memory | enforce a token budget, prove isolation at pack time, or replay the assembly |
+| Memory | mem0 | store/retrieve user & session memory | enforce a token budget, prove isolation at pack time, or replay the assembly |
+| Memory (temporal KG) | **Zep** | temporal **knowledge-graph** session memory (fact edges with valid-from/valid-to timestamps) | run a **pack-time** budget knapsack over pre-retrieved candidates, prove per-tenant isolation at a server boundary, or byte-exactly replay the assembly — it is a memory store, not a context kernel |
 | Cache | GPTCache | semantic response caching | reason about per-tenant memory-grounded non-cacheability or share a tenant boundary with retrieval |
-| Routing | LiteLLM, OpenRouter | model selection & failover | tie routing to the *assembled* prompt's tokenizer, residency policy, or budget ledger |
-| Observability | Langfuse, Helicone | trace & cost dashboards | reconstruct a request **byte-exact** — they log *what happened*, not enough to *re-derive* it |
+| Cache gateway | **Helicone** | proxy-based request **logging + response cache** gateway | byte-exactly **re-derive a context decision** — it caches and logs at the proxy edge, but never participates in retrieval/ACL/assembly, so it cannot reproduce *why this tenant saw this context* |
+| Routing (self-hosted lib) | **LiteLLM** | model selection & failover as an in-process Python library | tie routing to the *assembled* prompt's tokenizer, residency policy, or budget ledger |
+| Routing (hosted marketplace) | **OpenRouter** | hosted multi-model **marketplace** (one credit balance, many model vendors) | tie routing to the assembled prompt's **tokenizer + data-residency policy**; it has no view of the packed token count or tenant boundary — it **complements** ContextOS as a downstream adapter/dispatch target, not a substitute for the routing *stage* |
+| Observability | Langfuse | trace & cost dashboards | reconstruct a request **byte-exact** — they log *what happened*, not enough to *re-derive* it |
+| Observability (LangChain-native) | **LangSmith** | LangChain-native **tracing + eval** (run trees, dataset eval, prompt versioning) | re-derive a deterministic context decision **byte-for-byte** — it observes what an instrumented chain did; it cannot reproduce the assembly. ContextOS **exports OTel spans LangSmith can ingest**: ContextOS *replays*, LangSmith *observes* |
 | Orchestration | LangChain, LlamaIndex | chains, agents, glue | give you a governed runtime boundary; they are libraries you compile *into* your app, inheriting your blast radius |
+| Agent runtime / virtual context | **Letta / MemGPT** | agentic **OS-style virtual-context paging** + self-editing in-process memory; the agent re-executes steps and owns memory inside its own runtime | provide a **server-boundary multi-tenant isolation** guarantee, **byte-exact deterministic replay**, or a **token-budget knapsack over pre-retrieved candidates** — it *is* the agent (it schedules and re-executes), so it inherits the app's trust boundary. ContextOS is **neutral middleware under any agent**: it never schedules or re-executes, and agent-trace spans are **read-only** |
 
 The seam nobody owns is the one that matters: **the context window is a single shared resource that must be jointly optimized.** Memory recency interacts with assembler ordering. Cache fingerprints depend on the system-prompt version and the stable-fact set that retrieval produced. Routing must run *before* final packing so the correct tokenizer enforces the hard reserve (C3). Compression must run *after* ACL/redaction so it never compresses data the tenant was never allowed to see (pipeline invariant). Solve these in five separate tools and the seams between them are exactly where token budgets blow, isolation leaks, and "why did the model see that?" becomes unanswerable. ContextOS owns the seams.
 
@@ -68,6 +75,10 @@ The honest contract matters: `backend.invoke` is non-deterministic, so byte-equa
 ---
 
 ## Headline Numbers (Canonical)
+
+Every technology and latency pick below names ≥1 rejected alternative with the reason it fails, in the linked design file (per Master-Prompt §0).[^why-not]
+
+[^why-not]: **Where each pick's rejected alternative is justified.** pgvector **HNSW** over **IVFFlat** (IVFFlat's recall/latency degrades on high-churn per-tenant vector sets and needs periodic re-`lists` retraining; HNSW gives the 18 ms p95 ANN probe without rebuilds) → `02-module-deep-dive/2.1-memory-engine.md`. **Redis** for the exact cache tier over **Memcached** (Memcached has no native per-tenant keyspace namespacing, persistence, or atomic Lua-scripted ops needed for the `cache:{tenant_id}:{namespace}:{coarse_sig}` isolation contract; Redis delivers the <1 ms p99 exact-hash lookup) and the rejected **third vector engine just for caching** → `02-module-deep-dive/2.4-semantic-cache.md`. **Postgres FORCE RLS + RBAC firewall** over **library-imported isolation** (a monkey-patchable in-process check cannot survive the ≥10k hostile-probe gate at 0 cross-tenant leaks) → `07-security-model.md` and `02-module-deep-dive/2.3-rbac-firewall.md`. **BAAI/bge-small-en-v1.5 (384-dim)** in-process CPU embedding over a larger/remote model (held to ~6 ms p95) → `02-module-deep-dive/2.1-memory-engine.md`. **MMR (λ=0.70) + budget-knapsack over ≤512 candidates**, **RRF k=60**, **cos-dup 0.95**, and the **C3 8% tokenization margin** → `02-module-deep-dive/2.2-context-assembler.md`. **NLI-guarded compression (2–4× at ≥98% fact retention)** → `02-module-deep-dive/2.5-context-compressor.md`. Routing-stage placement and adapter targets (LiteLLM/OpenRouter as downstream dispatch, not the routing stage) → `02-module-deep-dive/2.6-model-router.md`. Deterministic replay schema and OTel export (consumable by LangSmith/Langfuse) → `02-module-deep-dive/2.7-observability.md` and `06-killer-features.md`.
 
 | Metric | Target |
 | --- | --- |
