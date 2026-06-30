@@ -1,5 +1,6 @@
 name: 📖 Documentation
 description: A docs problem — wrong, unclear, missing, or a broken link.
+title: "[Docs]: "
 labels: ["documentation", "needs-triage"]
 body:
   - type: markdown

@@ -1,6 +1,6 @@
 [project]
 name = "contextos"
-version = "0.0.1"
+version = "0.1.0"
 description = "ContextOS — the context & memory operating system for LLM applications. Replay-grade middleware that turns the context window into a per-tenant, budget-constrained, zero-trust runtime decision."
 readme = "README.md"
 license = { text = "Apache-2.0" }

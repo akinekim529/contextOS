@@ -1,9 +1,10 @@
 """The request pipeline.
 
 SecurityContext -> trace -> **semantic cache (short-circuits on hit)** -> memory retrieve ->
-**context assembly: rank + budget-pack + edge-load + inject** -> model router (single backend)
--> backend adapter -> response, with a decision record per stage. A cache hit skips retrieval,
-assembly, and the model call entirely; misses store the (non-memory-grounded) response.
+**context assembly: rank + budget-pack + edge-load + inject** -> **model router (cost/quality/
+latency utility + circuit-breaker fallback chain)** -> backend adapter -> response, with a
+decision record per stage. A cache hit skips everything downstream; misses store the
+(non-memory-grounded) response. When no router/registry is wired, a single adapter is used.
 """
 
 from __future__ import annotations
@@ -12,18 +13,22 @@ import hashlib
 
 from pydantic import BaseModel
 
-from .adapters.base import BackendAdapter, ChatMessage, ChatRequest, Role, Usage
+from .adapters.base import BackendAdapter, ChatMessage, ChatRequest, ChatResponse, Role, Usage
 from .assembler.budget import TokenBudget
 from .assembler.engine import ContextAssembler, ContextSources
 from .assembler.tokenizer import HeuristicTokenizer, Tokenizer
 from .assembler.weights import RankWeights
 from .cache.engine import SemanticCache
+from .compressor.engine import ContextCompressor
 from .memory.engine import MemoryEngine
 from .models.common import Action
 from .models.memory import MemoryCandidate
+from .observability.cost import CostLedger
 from .observability.tracer import Trace, Tracer
 from .replay.bundle import BundleMessage, render_prompt_hash
 from .replay.engine import ReplayDebugger
+from .router.engine import BackendRegistry, ModelRouter
+from .router.types import BackendUnavailable, RouteDecision
 from .security.context import SecurityContext
 from .security.rbac import PolicyEngine
 
@@ -50,9 +55,14 @@ class Pipeline:
         memory: MemoryEngine | None = None,
         assembler: ContextAssembler | None = None,
         cache: SemanticCache | None = None,
+        compressor: ContextCompressor | None = None,
         replay: ReplayDebugger | None = None,
+        router: ModelRouter | None = None,
+        backends: BackendRegistry | None = None,
+        cost: CostLedger | None = None,
         default_model: str | None = None,
         window_tokens: int = 6000,
+        compress_target_tokens: int = 256,
         weights: RankWeights | None = None,
         tokenizer: Tokenizer | None = None,
     ) -> None:
@@ -62,8 +72,13 @@ class Pipeline:
         self._memory = memory
         self._assembler = assembler
         self._cache = cache
+        self._compressor = compressor
         self._replay = replay
+        self._router = router
+        self._backends = backends
+        self._cost = cost
         self._default_model = default_model or "default"
+        self._compress_target = compress_target_tokens
         self._window_tokens = window_tokens
         self._weights = weights or RankWeights()
         self._tokenizer: Tokenizer = tokenizer or HeuristicTokenizer()
@@ -130,8 +145,29 @@ class Pipeline:
             else:
                 Trace.record(sp, "no memory engine configured", candidates="0")
 
+        # Compression runs AFTER retrieval/ACL and BEFORE assembly (pipeline invariant). The hot
+        # path uses the deterministic extractive tier; the abstractive (LLM) tier is opt-in.
+        with trace.span("compress", "context-compression") as sp:
+            if self._compressor is not None and candidates:
+                saved = 0
+                compressed: list[MemoryCandidate] = []
+                for c in candidates:
+                    block = await self._compressor.compress(
+                        c.content, self._compress_target, self._tokenizer, query=prompt
+                    )
+                    if block.compressed_tokens < block.original_tokens:
+                        saved += block.original_tokens - block.compressed_tokens
+                        compressed.append(c.model_copy(update={"content": block.text}))
+                    else:
+                        compressed.append(c)
+                candidates = compressed
+                Trace.record(sp, f"compressed candidates; saved ~{saved} tok", saved_tokens=str(saved))
+            else:
+                Trace.record(sp, "skipped (no compressor or no candidates)")
+
         messages: list[ChatMessage] = []
         injected = 0
+        assembled_tokens = 0
         with trace.span("assemble", "context-assembly") as sp:
             if self._assembler is not None:
                 # Router picks the model before final packing -> correct tokenizer (C3).
@@ -150,6 +186,7 @@ class Pipeline:
                 )
                 messages = assembled.messages
                 injected = sum(1 for d in assembled.decisions if d.kept)
+                assembled_tokens = assembled.used_tokens
 
                 # Flagship: freeze a content-addressed bundle so this decision is replayable.
                 bundle_cid = "-"
@@ -178,18 +215,38 @@ class Pipeline:
                 if system:
                     messages.append(ChatMessage(role=Role.SYSTEM, content=system))
                 messages.append(ChatMessage(role=Role.USER, content=prompt))
+                assembled_tokens = self._tokenizer.count(prompt) + self._tokenizer.count(system or "")
                 Trace.record(sp, "passthrough (no assembler configured)")
 
+        decision: RouteDecision | None = None
         with trace.span("route", "model-router") as sp:
-            Trace.record(sp, f"single-backend skeleton -> {self._adapter.name}", model=chosen_model)
+            if self._router is not None and self._backends is not None and len(self._backends):
+                # NoEligibleBackend propagates -> gateway maps it to HTTP 503 (fail-closed).
+                decision = self._router.route(
+                    ctx, prompt, assembled_tokens=assembled_tokens, registry=self._backends
+                )
+                chosen_model = decision.model_id
+                Trace.record(
+                    sp, f"routed -> {decision.backend} ({chosen_model})",
+                    backend=decision.backend, model=chosen_model,
+                    utility=f"{decision.utility:.4f}", difficulty=f"{decision.difficulty:.2f}",
+                    from_safe_default=str(decision.from_safe_default),
+                    fallback=",".join(decision.fallback_chain),
+                )
+            else:
+                Trace.record(sp, f"single-backend -> {self._adapter.name}", model=chosen_model)
 
         with trace.span("backend.invoke", "adapter.generate") as sp:
-            resp = await self._adapter.generate(
-                ChatRequest(model=chosen_model, messages=messages, max_tokens=max_tokens)
-            )
+            if decision is not None:
+                resp, used, chosen_model = await self._invoke_routed(decision, messages, max_tokens)
+            else:
+                resp = await self._adapter.generate(
+                    ChatRequest(model=chosen_model, messages=messages, max_tokens=max_tokens)
+                )
+                used = self._adapter.name
             Trace.record(
                 sp,
-                "generated",
+                f"generated via {used}",
                 finish_reason=str(resp.finish_reason),
                 prompt_tokens=str(resp.usage.prompt_tokens),
                 completion_tokens=str(resp.usage.completion_tokens),
@@ -208,6 +265,8 @@ class Pipeline:
             # Phase-2 bundle completion attach — only on a server terminal event (C8).
             if self._replay is not None and committed:
                 self._replay.attach_output(ctx, trace.trace_id, resp.text)
+            if self._cost is not None and committed:
+                self._cost.record(ctx, chosen_model, resp.usage)
             Trace.record(
                 sp,
                 "committed" if committed else "discarded (no terminal event)",
@@ -215,3 +274,26 @@ class Pipeline:
             )
 
         return ChatResult(text=resp.text, trace_id=trace.trace_id, model=resp.model, usage=resp.usage)
+
+    async def _invoke_routed(
+        self, decision: RouteDecision, messages: list[ChatMessage], max_tokens: int
+    ) -> tuple[ChatResponse, str, str]:
+        """Dispatch to the chosen backend, walking the fallback chain and tripping breakers."""
+        backends = self._backends
+        if backends is None:  # pragma: no cover - only called once a routing decision exists
+            raise BackendUnavailable("no backend registry configured")
+        last_exc: Exception | None = None
+        for name in [decision.backend, *decision.fallback_chain]:
+            entry = backends.get(name)
+            if entry is None or not entry.breaker.allows():
+                continue
+            try:
+                resp = await entry.adapter.generate(
+                    ChatRequest(model=entry.spec.model_id, messages=messages, max_tokens=max_tokens)
+                )
+                entry.breaker.record_success()
+                return resp, name, entry.spec.model_id
+            except Exception as exc:  # adapter/network failure -> trip breaker, try the next backend
+                entry.breaker.record_failure()
+                last_exc = exc
+        raise BackendUnavailable("all routed backends failed or are breaker-open") from last_exc

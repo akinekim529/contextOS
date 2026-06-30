@@ -78,6 +78,14 @@ class MemoryEngine:
         )
         return await self._store.add_memory(ctx, memory)
 
+    async def put(self, ctx: SecurityContext, memory: MemoryObject) -> MemoryObject:
+        """Store an existing MemoryObject verbatim (used by versioning rollback)."""
+        return await self._store.add_memory(ctx, memory)
+
+    async def all_memories(self, ctx: SecurityContext, *, limit: int = 4096) -> list[MemoryObject]:
+        """All in-scope memories (tenant+namespace enforced) — for consolidation/versioning."""
+        return await self._store.list_memories(ctx, limit=limit)
+
     async def retrieve(self, ctx: SecurityContext, query: str, *, k: int = 12) -> list[MemoryCandidate]:
         k = min(k, MAX_CANDIDATES)
         rows = await self._store.list_memories(ctx, limit=SCAN_LIMIT)  # scope-enforced (C2)

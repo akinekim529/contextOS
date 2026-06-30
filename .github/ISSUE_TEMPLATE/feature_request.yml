@@ -1,5 +1,6 @@
 name: ✨ Feature request
 description: Propose a capability or improvement for ContextOS.
+title: "[Feature]: "
 labels: ["enhancement", "needs-triage"]
 body:
   - type: markdown

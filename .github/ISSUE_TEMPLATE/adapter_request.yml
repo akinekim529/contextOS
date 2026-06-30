@@ -1,5 +1,6 @@
 name: 🔌 Backend adapter request
 description: Request support for a new LLM inference backend behind the BackendAdapter interface.
+title: "[Adapter]: "
 labels: ["adapter", "enhancement", "needs-triage"]
 body:
   - type: markdown
