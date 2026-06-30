@@ -90,6 +90,41 @@ class ContextOS:
 
 We ship **sync and async twins** (`chat`/`achat`, `stream`/`astream`). Rejected: async-only (forces a `asyncio.run` wart into every notebook and script and alienates the synchronous majority of integrators). Rejected: sync-only with a thread pool (silently serializes concurrency and lies about it under load). The sync client wraps the async core with a private event loop; there is one implementation, two faces.
 
+### 2.2 Idempotency-Key lifecycle: one key per logical call, reused across retries
+
+The SDK generates **exactly one `Idempotency-Key` per logical `chat()`/`stream()` call** and **reuses that same key across all internal retry attempts** (`max_retries=2`, so up to 3 wire attempts total). The key is a **ULID** minted once at call entry — *per call, never per attempt*. This is the load-bearing detail that makes retries dedupe against the server idempotency state machine (§5.5): a retried attempt must present the *same* key so the server recognizes the `(tenant_id, Idempotency-Key)` row and replays the committed response instead of re-invoking the backend.
+
+Op-sequence inside a single `chat()` call (3 attempts max, one key throughout):
+
+```python
+def chat(self, message, *, options=None, idempotency_key=None):
+    # ONE key per logical call, minted once. NOT regenerated on retry.
+    key = idempotency_key or new_ulid()        # e.g. "01J9F2K3...ULID"
+    body = self._build_body(message, options)  # body hash is stable => same key is safe
+    attempt = 0
+    while True:
+        try:
+            return self._post("/v1/chat", body, headers={
+                "Idempotency-Key": key,         # SAME key on attempt 0, 1, 2
+                "Accept": "application/json",
+            })
+        except RetriableError as e:             # 429 / 503 / 504 only (retriable=true)
+            attempt += 1
+            if attempt > self.max_retries:      # max_retries=2 => 3 total attempts
+                raise
+            sleep(backoff(attempt))             # full-jitter exponential backoff
+            # loop re-POSTs with the IDENTICAL key -> server dedupes (C15)
+```
+
+Worked wire trace — first attempt commits server-side but the response is lost in transit, second attempt replays it:
+
+```text
+attempt 0: POST /v1/chat  Idempotency-Key: 01J9F2K3...  -> server commits, response dropped (504 at proxy)
+attempt 1: POST /v1/chat  Idempotency-Key: 01J9F2K3...  -> idem.lookup HIT -> replay final ChatResponse, SAME trace_id, ZERO backend call
+```
+
+Rejected alternative: **a fresh key per attempt** (e.g. `key = new_ulid()` inside the retry loop). It breaks dedupe entirely — each attempt presents a key the server has never seen, so attempt 1 re-executes the full pipeline and re-invokes the backend, producing the canonical double-charge-and-double-write-back bug §5.5 exists to prevent. The key is a property of the *intent to send this body once*, not of any individual network attempt; it changes only when `message` or `options` change (a genuinely different logical call).
+
 ---
 
 ## 3. Python SDK — the power path
@@ -177,6 +212,16 @@ class ChatOptions:
 ```
 
 `ChatOptions` is `frozen=True, slots=True` on purpose: an options object is part of the cache fingerprint and the replay bundle. It must be **hashable and immutable** so the same options produce the same fingerprint deterministically. Rejected: a mutable `dict` of kwargs (un-hashable, untyped, and impossible to validate or replay).
+
+#### Why these numeric defaults (each names a rejected alternative)
+
+| Default | Value | Why this value | Rejected alternative + why it fails |
+|---|---|---|---|
+| `cache.semantic_threshold` | `0.92` cosine | Sweet spot on the bge-small-en-v1.5 (384-dim) embedding geometry: high enough that a hit is genuinely the same intent, low enough to keep the semantic tier inside the canonical 25-45% cache hit-ratio band | `< 0.90` admits **false-positive hits** — near-but-different queries collide and the cache serves a stale/wrong answer (a correctness bug, the worst cache failure). `> 0.95` collapses the hit-rate — only near-verbatim paraphrases match, so the semantic tier (8-15ms p95) earns almost nothing over the exact tier and the 40-65% token-savings target slips. The cache section owns the authoritative tuning; this is the SDK default |
+| `memory.recency_half_life_days` | `30.0` | One month half-life balances "remember durable user facts" against "decay stale context"; orthogonal to assembler lost-in-the-middle ordering (C1) | A very short half-life (`~7`) over-forgets durable preferences (re-asking the user facts they already gave); a very long one (`~180`) lets superseded facts outrank current ones at retrieval. 30d is the per-call default; long-lived projects override down (the §3.2 example uses `14.0`) |
+| `budget.tokenization_margin` | `0.08` (C3) | Conservative 8% headroom on the **pre-route** token estimate so the post-route, tokenizer-correct re-validation rarely trips the hard output reserve and returns `413` (§4.3) | `0` (trust the pre-route estimate) under-counts because the final model's tokenizer differs from the estimator, overflowing the reserve and forcing `413`/extra compression passes. A large margin (`~0.20`) wastes context budget on phantom headroom, shrinking how much memory can be packed and degrading answer quality. `0.08` is the canonical C3 margin |
+
+These three defaults are the SDK's surface mirror of values whose authority lives in the cache and budget sections; this section sets the *client default* and defers final tuning there, but the numbers above are canonical and must not be contradicted.
 
 ### 3.2 Complete power-path example
 
@@ -286,6 +331,10 @@ class ChatResponse:
 
 `cost_breakdown` is non-negotiable: memory consolidation, query embedding, and NLI-guarded compression each spend money, and per the scope-boundary invariants those costs **enter the budget ledger**. The API surfaces them so the caller can see that a "cheap" routed answer still cost 6 ms of embedding and a fraction of a cent of NLI inference.
 
+**Where do the semantic-cache and ANN-probe costs go?** They are **folded into the `embedding` key**, not split into a separate `semantic_cache` / `ann_probe` key. The rationale is that the semantic-cache lookup and the memory-retrieval ANN probe are *driven by the same artifact* — the one query embedding (`~6ms`, bge-small-en-v1.5, 384-dim) computed once per request and reused for both the semantic-cache probe (8-15ms p95) and the pgvector HNSW retrieval probe (18ms p95). The dollar cost that hits the ledger is the **embedding inference**; the ANN probe itself is a local index scan with negligible *marginal* monetary cost (it consumes latency budget — surfaced per-stage in §6.4 as the `cache` and `retrieval` rows — not a separate billable line item). So `embedding` is the honest, single home for "what the query-vector machinery cost."
+
+Rejected alternative: **add a distinct `cost_breakdown["semantic_cache"]` (or `"ann_probe"`) key.** It would (1) double-count — the same `~6ms` embedding underlies both the cache probe and retrieval, so attributing a separate `semantic_cache` charge either splits one cost arbitrarily or invents a second one; (2) break cross-section assumption #3, which locks the vocabulary to `{model, embedding, compression_nli}` extended *only additively* — every client parser and the §5.4 partial-cost record would have to change for a line that is structurally `~0` in dollars; and (3) confuse the latency/cost split — ANN-probe expense is a *latency* concern (owned by Section 9's p95 budget and the §6.4 per-stage `p_ms`), not a monetary one. If a future deployment runs a *metered* managed vector service whose probes carry a real per-query price, the vocabulary is extended additively with a `vector_probe` key at that time; until then, folding into `embedding` is the correct, non-double-counting choice.
+
 ---
 
 ## 4. REST API — `POST /v1/chat`
@@ -388,6 +437,8 @@ Two design choices worth defending:
 | `499` | Client closed request before server terminal | C8: write-back **discarded**; partial cost attributed (see §5.4) |
 | `503` | No safe backend satisfies hard filters | C9: even the safe-default pool failed residency/allowlist; we fail closed, never relax residency |
 | `504` | Backend deadline exceeded | ContextOS-side timeout on the adapter call |
+
+**Why `499` (client closed request) and not `408` (request timeout) for an abort.** A client TCP close before the server terminal is the **client** withdrawing, not the server timing out — `499` (nginx-origin, widely understood) names exactly that: *the client closed the connection while the server was still working*. Rejected: `408 Request Timeout`. `408` has the wrong semantics — RFC 7231 §6.5.7 defines it as "the **server** did not receive a complete request message within the time it was prepared to wait," i.e. a *slow or stalled inbound request*. In our abort case the request was received whole and the server was mid-generation; emitting `408` would falsely blame the server's input-wait path, mislead retry logic (a `408` invites an immediate identical retry of an *unsent* request, whereas a `499` correctly signals "you hung up on a request that may have committed — retry with the **same** `Idempotency-Key` per §5.5"), and pollute the latency table's `adapter`-stage attribution. `499` keeps the abort cleanly attributed to the client and routes it to the §5.4 partial-cost path. (`504` remains the distinct *server-side* deadline on the backend adapter — server timeout, not client withdrawal.)
 
 ### 4.4 Typed error envelope
 
@@ -756,5 +807,5 @@ The hard contract is: **deterministic stages are byte-exact or the replay fails*
 
 1. **The response id IS the trace_id** (`chat.completion.id == contextos.trace_id == replay handle`). Observability (Section on tracing) and the Replay Debugger must treat the OpenAI `id` field as the single ULID correlation key — no separate correlation id.
 2. **The `contextos` request block is the canonical serialization of `ChatOptions`.** Any section adding a knob (router, assembler, cache) must add it under `contextos.*` with the same field name as the SDK dataclass; the SDK is a typed mirror, not a superset.
-3. **`cost_breakdown` keys `{model, embedding, compression_nli}` are a fixed vocabulary.** The budget-ledger / cost section must emit exactly these keys (extended only additively) so client parsers and the partial-cost record (§5.4) stay stable.
+3. **`cost_breakdown` keys `{model, embedding, compression_nli}` are a fixed vocabulary.** The budget-ledger / cost section must emit exactly these keys (extended only additively) so client parsers and the partial-cost record (§5.4) stay stable. Semantic-cache and ANN-probe expense is **folded into `embedding`** (one query vector drives both the cache probe and retrieval; the probe itself is a latency cost, not a billable line — see §3.3); no `semantic_cache`/`ann_probe` key exists. Any future metered managed-vector service is added additively as `vector_probe`, never by splitting `embedding`.
 4. **Pipeline `stage` names are a closed enum** (`auth, cache, retrieval, acl, compression, assembly, routing, adapter, write_back`) shared by the error envelope (§4.4), trace records (§6.4), and the replay deterministic-stage list (§6.5). The Architecture and Observability sections must use these exact tokens so a `stage` value maps 1:1 from an error to a latency row to a replay assertion.

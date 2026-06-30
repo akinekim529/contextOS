@@ -423,3 +423,66 @@ This section commits to the following, which other sections must honor:
 3. **The model is selected before final packing (C3)** so the correct chat template/tokenizer drives the structural-separation escaping in 7.4.1 — the Router and Assembler sections must preserve this ordering.
 4. **Vector payloads and ids are encrypted under the relevant DEK (per-tenant, or per-subject when forgettable)** — the Memory Engine and VectorStore-adapter sections must treat embeddings as encrypted-at-rest and within crypto-shred scope (C11).
 5. **Residency is enforced both at routing (C9) and cryptographically via per-region KEKs (7.6)** — the Routing and KMS/Ops sections must keep KEKs region-pinned so a routing bug cannot become a silent cross-border transfer.
+6. **Every data class has a bounded, code-enforced retention period (7.11)** — the Memory Engine (Redis TTLs), Cache (semantic-cache sweep), and Replay/Ops sections must wire the TTL/GC enforcement listed in 7.11, and treat the tombstone-vs-payload retention split as load-bearing for crypto-shred RTBF.
+
+---
+
+## 7.11 Data Retention
+
+Retention is a *security* control, not a storage-cost knob: every byte ContextOS keeps past its purpose is attack surface and a KVKK/GDPR **data-minimization** liability. The governing rule mirrors the rest of this section — **retention is bounded and enforced by code (a TTL or a scheduled GC sweep), never by operator memory.** A data class with no enforcement mechanism is treated as a defect, exactly as a tenant-scoped table with no RLS policy is in 7.2.2. This subsection is the single source of truth for "how long does ContextOS keep X, and what deletes it."
+
+### 7.11.1 Data-class → retention schedule
+
+The retention period is the *maximum* age; crypto-shred RTBF (7.7) can erase a subject's slice of any class earlier, and that erasure is independent of the schedule below (destroying the subject DEK makes the payload undecryptable regardless of how long the ciphertext physically lingers).
+
+| Data class | Store | Retention | Enforcement mechanism | RTBF interaction |
+|---|---|---|---|---|
+| Working / short-term memory | Redis | **TTL = 24h** | Redis native key TTL (`EXPIRE` set at write) | values for forgettable subjects are ciphertext under the subject DEK; DEK-destroy makes them unreadable before the 24h TTL fires |
+| Exact-hash response cache | Redis | **TTL = 1h** | Redis native key TTL | same — DEK-scoped ciphertext; TTL-expiry and crypto-shred are both terminal |
+| Semantic cache entries | pgvector (`semantic_cache`) | **TTL = 7d** | scheduled GC sweep (hourly), `WHERE created_at < now() - interval '7 days'` | sweep also honors tombstones (7.7.2); subject-DEK-destroy renders the cached payload undecryptable immediately |
+| Long-term memory items | Postgres + pgvector | **retain until tenant deletes or subject RTBF** | no time-based expiry; lifecycle is explicit delete or crypto-shred (7.7) | primary RTBF target — payloads + embeddings under per-subject DEK (C11) |
+| Replay bundles | Object storage | **TTL = 90d** | scheduled GC sweep (daily), object-key `tenant_id`-prefixed, deletes by `created_at` lifecycle | immutable/content-addressed → cannot edit; subject's slice is crypto-shredded via subject DEK, bytes reclaimed at 90d or by tombstone sweep |
+| Audit logs (auth, RBAC denials, routing decisions) | Postgres (append-only) | **1y** | scheduled GC sweep (daily), partition-drop by month | retained through RTBF: logs record *that* a subject was shredded (cert id), not their PII — see 7.11.3 |
+| Deletion tombstones + certificates | Postgres (`deletion_tombstones`) | **indefinite** | none — never expired by design | the proof-of-erasure; must outlive every payload it certifies |
+
+The two endpoints of this table are deliberate. Short-lived operational state (Redis working memory, caches) is the **shortest** retention because it is pure performance scaffolding that can always be rebuilt from long-term memory; keeping it longer only widens the blast radius of a Redis compromise. Tombstones and deletion certificates are the **only** indefinitely-retained class, because erasing the proof that you erased someone is itself a compliance failure — a DPA audit in month 18 must still be answerable.
+
+### 7.11.2 Enforcement: Redis TTL vs scheduled GC sweep
+
+Two mechanisms, chosen per store by what the store can guarantee:
+
+**(a) Redis native TTL** — for any class that lives only in Redis (working memory, exact-hash cache). The TTL is set *at write time*, not by a reaper, so expiry is a property of the key itself and survives process restarts and failover:
+
+```python
+# Working memory write — retention is set inline, never "swept" later.
+await redis.set(
+    key=f"wm:{sc.tenant_id}:{sc.namespace}:{item_id}",
+    value=aesgcm_encrypt(payload, dek=sc.subject_dek_id or sc.tenant_dek_id),
+    ex=86_400,            # 24h, in seconds — the retention contract, enforced by Redis
+)
+# Exact-hash cache write:  ex=3_600  (1h)
+```
+
+**(b) Scheduled GC sweep** — for stores with no native TTL (Postgres rows, pgvector cache entries, object-storage bundles). The sweep is the **same idempotent, cost-tracked batch pattern** as the RTBF GC (7.7.2) — re-running it is always safe, a crashed sweep resumes, and it is rate-limited so it never competes with the **<50ms p95** assembly / **<100ms p95** retrieval / **<250ms p95** control-overhead budgets:
+
+```sql
+-- Semantic-cache retention sweep (hourly). Same predicate shape for replay bundles (90d, daily).
+DELETE FROM semantic_cache
+WHERE  created_at < now() - interval '7 days'      -- retention horizon
+   OR  subject_id IN (SELECT subject_id FROM deletion_tombstones
+                      WHERE tenant_id = semantic_cache.tenant_id);  -- RTBF coupling
+```
+
+The sweep cadence is bounded so that **worst-case over-retention is one sweep interval** (≤1h for semantic cache, ≤1d for bundles/logs), and that bound is what we report to compliance — not "best effort." A sweep that falls behind raises an alert (over-retention is a policy violation, treated like an SLO breach), but, crucially, it **leaks nothing readable** for any crypto-shredded subject because step 2 of 7.7.1 already made that slice undecryptable. Time-based retention reclaims *bytes*; crypto-shred enforces *erasure*. They are orthogonal and both required.
+
+### 7.11.3 Interaction with crypto-shred RTBF (7.7)
+
+The retention schedule and crypto-shred are two independent erasure paths that compose cleanly:
+
+1. **Scheduled retention is purpose-based, blanket, and ciphertext-blind.** It deletes by age regardless of subject — it never needs the DEK and never decrypts anything to decide.
+2. **Crypto-shred (7.7) is subject-based and immediate.** Destroying the subject DEK makes that subject's slice of *every* class undecryptable the instant it completes, **before** the retention TTL/sweep would have fired. The retention sweep then reclaims the now-dead bytes opportunistically, and the RTBF clause in the sweep predicate (7.11.2(b)) guarantees a tombstoned subject's rows are dropped on the very next pass even if they are younger than the retention horizon.
+3. **Audit logs and tombstones are retained *through* RTBF on purpose.** They contain no subject PII — an audit row records `(request_id, principal_id, decision, certificate_id)`, and the deletion certificate (7.7.3) names the *method* and *scope*, never the erased content. So retaining them for 1y / indefinitely does not re-introduce the personal data the subject asked to forget; it is the evidence trail that the forgetting happened.
+
+This is why the indefinite-tombstone row does not contradict data-minimization: the minimized thing (the subject's PII and embeddings) is gone at step 2 of 7.7.1; what survives is a content-free receipt.
+
+**Rejected alternative — indefinite retention with on-request purge only ("keep everything, delete when someone asks").** This is the most common naive design and it fails on three axes at once. (1) **KVKK/GDPR data-minimization (GDPR Art. 5(1)(e) storage-limitation; KVKK Art. 4):** keeping working memory, caches, and replay bundles forever because no one requested deletion is a standing violation independent of any RTBF request — the law requires data not be kept "longer than is necessary," and "until someone complains" is not a retention period. (2) **Localization:** under KVKK, unbounded replay bundles and caches accumulate copies of in-zone personal data that drift out of any documented lifecycle, undermining the residency guarantee of 7.8 (you cannot attest where data lives if you never bounded how long it lives). (3) **Blast radius:** an indefinitely-retained Redis or cache compromise exposes *all history*, not a 1–24h window. On-request purge also cannot be made reliable across the four stores for the same reason synchronous hard-delete was rejected in 7.7 — it is racy and unprovable. We therefore bound every class by code (TTL or sweep) **and** keep crypto-shred for subject-specific immediate erasure; the two together, not either alone, satisfy minimization, localization, and provable RTBF.

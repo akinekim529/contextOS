@@ -98,7 +98,7 @@ UtcTimestamp = Annotated[
 ```python
 from enum import Enum
 from typing import Annotated
-from pydantic import StringConstraints, BaseModel, ConfigDict, Field
+from pydantic import StringConstraints, BaseModel, ConfigDict, Field, computed_field
 
 TenantId = Annotated[str, StringConstraints(min_length=1, max_length=64,
                                             pattern=r"^[a-z0-9][a-z0-9_-]{0,63}$")]
@@ -130,6 +130,8 @@ class AccessScope(str, Enum):
     TENANT = "tenant"          # any principal in the tenant
     SHARED_ORG = "shared_org"  # cross-tenant, gated by an allow RBACPolicy rule
 ```
+
+> **Rejected alternative (AccessScope 4-band enum vs free-form ACL tags):** a free-form `set[str]` of ACL tags per object was rejected — it is not statically analyzable (no compiler/CI can prove the set of reachable scopes), it cannot be mapped onto a Postgres RLS `USING` predicate without a runtime join against an arbitrary tag table, and an unbounded tag vocabulary defeats the `>= 10k` hostile-probe leak gate because the prober cannot enumerate the band space to fuzz it exhaustively. The 4-band enum is finite and totally ordered (`private < project < tenant < shared_org`), so each band lowers to one deterministic RLS clause, the ACL/redaction stage can decide visibility with a single integer compare, and CI can exhaustively assert all four bands against a hostile second tenant.
 
 ### 1.4 Provenance
 
@@ -164,10 +166,12 @@ A `MemoryObject` **never inlines its vector**. It holds an `EmbeddingRef` pointi
 - The **vector** lives in pgvector (HNSW, co-located in Postgres at launch) or Qdrant (escape hatch beyond ~5M vectors/tenant), behind the `VectorStore` adapter.
 - Per **C11**, the vector **payload and id are encrypted under the per-subject DEK**. RTBF is a `tombstone + idempotent GC sweep`, and **crypto-shredding the DEK renders the vector unrecoverable** without sweeping every HNSW node synchronously. Embeddings are therefore *within* crypto-shred scope, not a forgotten copy.
 
+> **Rejected alternative (Qdrant as the escape hatch vs Milvus / Weaviate / FAISS):** the at-scale backend is **Qdrant**, not Milvus, Weaviate, or FAISS. FAISS was rejected because it is an in-process library with no native multi-tenant collections, no RLS-equivalent isolation, and no out-of-process crypto-at-rest — it cannot host the per-subject-DEK-encrypted payloads C11 requires. Milvus was rejected for operational weight: it pulls in etcd + Pulsar/Kafka + MinIO as mandatory dependencies, a far heavier control plane than a single Qdrant binary for the modest per-tenant collections we escape to. Weaviate was rejected because its strong differentiator is built-in vectorization modules we do not use (we own the `EmbeddingProvider`), so we would pay its module surface area for nothing. The crossover that triggers the migration off pgvector is **~5M vectors/tenant**: beyond that point HNSW index build + co-located query load contends with relational OLTP on the same Postgres node, so the vector workload is moved to a dedicated Qdrant cluster while `EmbeddingRef.backend` flips per-collection (the `MemoryObject` contract is unchanged — that is the whole point of the indirection).
+
 ```python
 class VectorBackend(str, Enum):
     PGVECTOR = "pgvector"   # launch default, HNSW, <=5M vectors/tenant
-    QDRANT = "qdrant"       # escape hatch at scale
+    QDRANT = "qdrant"       # escape hatch beyond ~5M vectors/tenant (vs Milvus/Weaviate/FAISS — see note above)
 
 class EmbeddingRef(BaseModel):
     """Indirection to the vector store. The vector lives there, encrypted under the
@@ -193,6 +197,8 @@ The default embedder is **BAAI/bge-small-en-v1.5 (384-dim)**, self-hosted behind
 ## 2. `MemoryObject`
 
 The unit the Memory Engine stores and returns. **C1 applies:** the Memory Engine returns candidates carrying **raw per-modality scores only** — it does *not* finalize ranking. Final ranking + budget packing is the **Context Assembler's** sole authority. So `MemoryObject` carries `importance` and `last_accessed` (memory-decay/recency inputs) but **no final rank** — recency decay is orthogonal to the assembler's lost-in-the-middle ordering.
+
+> **Rejected alternative (5-value tier taxonomy vs a collapsed 3-tier model):** a coarser `{working, long_term, semantic}` 3-tier model was rejected because the five tiers carry **distinct eviction / decay / consolidation provenance** that a 3-tier collapse would erase. `working` and `short_term` are both Redis-TTL but differ in lifetime and eviction trigger (turn-scoped vs session-scoped), so merging them loses the per-turn eviction signal. `episodic` and `semantic` are both Postgres+pgvector but differ in **consolidation provenance**: `episodic` rows are time-stamped event memories that the async consolidation job reads, whereas `semantic` rows are the *output* of that job (`Provenance.kind == "consolidation"`). Collapsing episodic into semantic would make a consolidated fact indistinguishable from its source episode, breaking the Replay Debugger's "why was this byte here?" lineage and the recency-decay eviction math (which applies to episodic but not to derived semantic facts). Five tiers stay because each names a different (datastore, eviction rule, decay applicability, consolidation role) tuple.
 
 ```python
 class MemoryTier(str, Enum):
@@ -668,10 +674,16 @@ class TraceSpan(BaseModel):
         description="True if retained despite sampling: status==error OR req cost > $0.05",
     )
 
+    # DERIVED, not stored: duration_ms is computed from start_time/end_time, never
+    # persisted as a column. @computed_field makes Pydantic emit it in model_dump()
+    # so it appears in the example payload, but there is no settable duration_ms field.
+    @computed_field  # type: ignore[prop-decorator]
     @property
     def duration_ms(self) -> float:
         return (self.end_time - self.start_time).total_seconds() * 1000.0
 ```
+
+`duration_ms` is a **`@computed_field`** (derived from `end_time - start_time`), **not a stored field**: there is no `duration_ms` column in any table and no way to set it independently of the two timestamps — which keeps the span's duration internally consistent and replay-deterministic (a stored, separately-writable `duration_ms` could drift from `end_time - start_time` and silently corrupt the latency-budget audit).
 
 ### 6.1 C7: deterministic stages vs the non-deterministic backend
 
@@ -714,7 +726,7 @@ When a stream ends, the **terminal-event source decides commit vs discard** (C8)
 }
 ```
 
-The `duration_ms: 5.0` matches the **5 ms** model-routing line of the Section 9 latency budget; `rbac_action: "route"` and `residency: "eu"` show the C9/C10 hard filter evaluated on static policy; `decision_record_ref` is the join into the replay bundle for byte-exact replay of this routing decision.
+Here `duration_ms: 5.0` is a **`@computed_field` (derived from `end_time - start_time`), not a stored field** — it appears in the serialized payload only because `@computed_field` instructs Pydantic to emit it; `11:42:17.105Z - 11:42:17.100Z == 5.0 ms`. The `duration_ms: 5.0` matches the **5 ms** model-routing line of the Section 9 latency budget; `rbac_action: "route"` and `residency: "eu"` show the C9/C10 hard filter evaluated on static policy; `decision_record_ref` is the join into the replay bundle for byte-exact replay of this routing decision.
 
 ---
 
